@@ -150,7 +150,8 @@ void RtspAudioComponent::setup() {
   if ((this->stream_info_.get_sample_rate() != 16000 && this->stream_info_.get_sample_rate() != 32000) ||
       this->stream_info_.get_channels() != 1 ||
       this->stream_info_.get_bits_per_sample() != 16) {
-    ESP_LOGE(TAG, "Unsupported microphone stream: %u Hz / %u ch / %u bit", this->stream_info_.get_sample_rate(),
+    ESP_LOGE(TAG, "Unsupported microphone stream: %lu Hz / %u ch / %u bit",
+             static_cast<unsigned long>(this->stream_info_.get_sample_rate()),
              this->stream_info_.get_channels(), this->stream_info_.get_bits_per_sample());
     this->mark_failed();
     return;
@@ -186,8 +187,9 @@ void RtspAudioComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  Listen port: %u", this->listen_port_);
   ESP_LOGCONFIG(TAG, "  Packet ms: %u", this->packet_duration_ms_);
   ESP_LOGCONFIG(TAG, "  Session timeout: %us", SESSION_TIMEOUT_SECONDS);
-  ESP_LOGCONFIG(TAG, "  Audio: %u Hz / %u ch / %u bit, %u samples/pkt", this->stream_info_.get_sample_rate(),
-                this->stream_info_.get_channels(), this->stream_info_.get_bits_per_sample(), this->samples_per_packet_);
+  ESP_LOGCONFIG(TAG, "  Audio: %lu Hz / %u ch / %u bit, %lu samples/pkt",
+                static_cast<unsigned long>(this->stream_info_.get_sample_rate()), this->stream_info_.get_channels(),
+                this->stream_info_.get_bits_per_sample(), static_cast<unsigned long>(this->samples_per_packet_));
   ESP_LOGCONFIG(TAG, "  DC blocker: on (5 Hz, always)");
   if (this->lowcut_bypass_) {
     ESP_LOGCONFIG(TAG, "  Low-cut filter: off (DC blocker still active)");
@@ -315,7 +317,7 @@ bool RtspAudioComponent::allocate_stream_buffers_() {
   // The configured jitter buffer lands in PSRAM on capable boards automatically.
   if (this->ring_buffer_ == nullptr) {
     const size_t bytes = this->stream_info_.ms_to_bytes(this->stream_buffer_ms_);
-    this->ring_buffer_ = ::esphome::RingBuffer::create(bytes);
+    this->ring_buffer_ = ring_buffer::RingBuffer::create(bytes);
     if (this->ring_buffer_ == nullptr) {
       ESP_LOGE(TAG, "Ring buffer allocate failed (%zu bytes)", bytes);
       return false;
@@ -381,8 +383,8 @@ void RtspAudioComponent::start_listen_socket_() {
     return;
   }
 
-  ESP_LOGI(TAG, "RTSP listening on port %u (L16/%u/1, PT %u)", this->listen_port_, this->stream_info_.get_sample_rate(),
-           RTP_PAYLOAD_TYPE);
+  ESP_LOGI(TAG, "RTSP listening on port %u (L16/%lu/1, PT %u)", this->listen_port_,
+           static_cast<unsigned long>(this->stream_info_.get_sample_rate()), RTP_PAYLOAD_TYPE);
 }
 
 void RtspAudioComponent::try_accept_() {
@@ -413,7 +415,7 @@ void RtspAudioComponent::try_accept_() {
   this->interleaved_ = false;
   this->tx_buffer_.clear();
   this->last_rtsp_activity_usec_ = esp_timer_get_time();
-  ESP_LOGI(TAG, "RTSP client accepted (session %u)", this->session_id_);
+  ESP_LOGI(TAG, "RTSP client accepted (session %lu)", static_cast<unsigned long>(this->session_id_));
 }
 
 void RtspAudioComponent::drain_control_socket_() {
@@ -495,9 +497,9 @@ std::string RtspAudioComponent::build_sdp_() const {
       "t=0 0\r\n"
       "m=audio 0 RTP/AVP %u\r\n"
       "c=IN IP4 0.0.0.0\r\n"
-      "a=rtpmap:%u L16/%u/1\r\n",
+      "a=rtpmap:%u L16/%lu/1\r\n",
       static_cast<unsigned>(RTP_PAYLOAD_TYPE), static_cast<unsigned>(RTP_PAYLOAD_TYPE),
-      this->stream_info_.get_sample_rate());
+      static_cast<unsigned long>(this->stream_info_.get_sample_rate()));
   if (!this->track_url_.empty())
     sdp += "a=control:" + this->track_url_ + "\r\n";
   return sdp;
@@ -720,7 +722,8 @@ void RtspAudioComponent::start_streaming_() {
 #endif
 
   this->mic_source_->start();
-  ESP_LOGI(TAG, "Streaming RTP: %u samples/packet (%u ms)", this->samples_per_packet_, this->packet_duration_ms_);
+  ESP_LOGI(TAG, "Streaming RTP: %lu samples/packet (%u ms)", static_cast<unsigned long>(this->samples_per_packet_),
+           this->packet_duration_ms_);
 }
 
 void RtspAudioComponent::stop_streaming_() {
@@ -865,8 +868,9 @@ void RtspAudioComponent::log_stream_stats_(int64_t now) {
     } else {
       auto *addr4 = reinterpret_cast<sockaddr_in *>(&this->client_rtp_addr_);
       const uint32_t ip = ntohl(addr4->sin_addr.s_addr);
-      ESP_LOGI(TAG, "First RTP packet sent to %u.%u.%u.%u:%u", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF,
-               ip & 0xFF, ntohs(addr4->sin_port));
+      ESP_LOGI(TAG, "First RTP packet sent to %u.%u.%u.%u:%u", static_cast<unsigned>((ip >> 24) & 0xFF),
+               static_cast<unsigned>((ip >> 16) & 0xFF), static_cast<unsigned>((ip >> 8) & 0xFF),
+               static_cast<unsigned>(ip & 0xFF), ntohs(addr4->sin_port));
     }
   }
 
@@ -893,8 +897,9 @@ void RtspAudioComponent::log_stream_stats_(int64_t now) {
   // 20 ms packet cadence (50 packets/s).
   if (now - this->last_stats_usec_ >= 5'000'000) {
     const uint32_t pkts = this->rtp_packets_sent_ - this->stats_last_packets_;
-    ESP_LOGD(TAG, "RTP stream: %u packets/5s; mic: %u callbacks, %u empty, %u bytes; ring buffer %zu bytes", pkts,
-             this->mic_callbacks_, this->mic_empty_callbacks_, this->mic_bytes_received_,
+    ESP_LOGD(TAG, "RTP stream: %lu packets/5s; mic: %lu callbacks, %lu empty, %lu bytes; ring buffer %zu bytes",
+             static_cast<unsigned long>(pkts), static_cast<unsigned long>(this->mic_callbacks_),
+             static_cast<unsigned long>(this->mic_empty_callbacks_), static_cast<unsigned long>(this->mic_bytes_received_),
              this->ring_buffer_->available());
     this->last_stats_usec_ = now;
     this->stats_last_packets_ = this->rtp_packets_sent_;
