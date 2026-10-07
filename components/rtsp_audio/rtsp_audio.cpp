@@ -410,6 +410,9 @@ void RtspAudioComponent::try_accept_() {
     return;
 
   cli->setblocking(false);
+  int tcp_nodelay = 1;
+  if (cli->setsockopt(IPPROTO_TCP, TCP_NODELAY, &tcp_nodelay, sizeof(tcp_nodelay)) != 0)
+    ESP_LOGW(TAG, "RTSP TCP_NODELAY failed errno=%d", errno);
 
   if (this->control_socket_) {
     ESP_LOGW(TAG, "Reject second RTSP client (single session MVP)");
