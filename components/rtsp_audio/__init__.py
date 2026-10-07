@@ -5,6 +5,7 @@ from esphome.const import CONF_ID, CONF_MICROPHONE, CONF_PORT, Framework
 
 CONF_PACKET_MS = "packet_ms"
 CONF_BUFFER_MS = "buffer_ms"
+CONF_MAX_CATCHUP_PACKETS = "max_catchup_packets"
 CONF_BYPASS_DSP = "bypass_dsp"
 CONF_RTSP_AUDIO_ID = "rtsp_audio_id"
 
@@ -22,6 +23,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_PORT, default=554): cv.port,
             cv.Optional(CONF_PACKET_MS, default=20): cv.int_range(10, 100),
             cv.Optional(CONF_BUFFER_MS, default=1000): cv.int_range(100, 2000),
+            cv.Optional(CONF_MAX_CATCHUP_PACKETS, default=8): cv.int_range(1, 32),
             cv.Optional(CONF_BYPASS_DSP, default=False): cv.boolean,
             cv.Optional(
                 CONF_MICROPHONE, default={}
@@ -51,6 +53,7 @@ async def to_code(config):
     cg.add(var.set_listen_port(config[CONF_PORT]))
     cg.add(var.set_packet_duration_ms(config[CONF_PACKET_MS]))
     cg.add(var.set_stream_buffer_ms(config[CONF_BUFFER_MS]))
+    cg.add(var.set_max_catchup_packets(config[CONF_MAX_CATCHUP_PACKETS]))
     cg.add(var.set_bypass_dsp(config[CONF_BYPASS_DSP]))
     mic_source = await microphone.microphone_source_to_code(config[CONF_MICROPHONE])
     cg.add(var.set_microphone_source(mic_source))

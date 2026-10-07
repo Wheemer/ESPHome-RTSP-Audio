@@ -834,20 +834,21 @@ void RtspAudioComponent::maybe_send_rtp_() {
   // and eventually overflows. Instead, send as many packets as the elapsed time
   // allows and advance the deadline by exactly one interval each time, so the
   // average send rate matches the audio production rate regardless of loop().
-  constexpr int MAX_PACKETS_PER_LOOP = 8;
   int sent = 0;
-  while (sent < MAX_PACKETS_PER_LOOP && now - this->last_rtp_usec_ >= static_cast<int64_t>(this->rtp_interval_usec_)) {
+  while (sent < this->max_catchup_packets_ &&
+         now - this->last_rtp_usec_ >= static_cast<int64_t>(this->rtp_interval_usec_)) {
     if (!this->send_one_rtp_packet_())
       break;  // no buffered audio yet / socket busy: retry next loop, don't advance deadline
     this->last_rtp_usec_ += this->rtp_interval_usec_;
     sent++;
   }
 
-  // Hit the per-loop cap and still behind (a long stall, e.g. a flash write).
-  // Snap the deadline to now so we don't burst MAX_PACKETS_PER_LOOP every loop
+  // Hit the configured per-loop cap and still behind (a long stall, e.g. a flash write).
+  // Snap the deadline to now so we don't burst the backlog every loop
   // indefinitely; the backlog is dropped in favour of staying near real time.
-  if (sent == MAX_PACKETS_PER_LOOP && now - this->last_rtp_usec_ > static_cast<int64_t>(this->rtp_interval_usec_)) {
-    ESP_LOGW(TAG, "RTP pacing behind by >%d packets; resyncing", MAX_PACKETS_PER_LOOP);
+  if (sent == this->max_catchup_packets_ &&
+      now - this->last_rtp_usec_ > static_cast<int64_t>(this->rtp_interval_usec_)) {
+    ESP_LOGW(TAG, "RTP pacing behind by >%u packets; resyncing", this->max_catchup_packets_);
     this->last_rtp_usec_ = now;
   }
 
