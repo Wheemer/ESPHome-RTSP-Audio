@@ -307,11 +307,9 @@ bool RtspAudioComponent::allocate_stream_buffers_() {
   // from under the new session.
   this->teardown_guard_.cancel();
   // RingBuffer::create() already uses RAMAllocator<uint8_t> internally, so
-  // ~1 s of jitter slack lands in PSRAM on capable boards automatically.
-  // At 32 kHz mono 16-bit that's 64 KB — fits in internal RAM on no-PSRAM
-  // boards (2 s would be 128 KB and routinely fails to allocate).
+  // The configured jitter buffer lands in PSRAM on capable boards automatically.
   if (this->ring_buffer_ == nullptr) {
-    const size_t bytes = this->stream_info_.ms_to_bytes(1000);
+    const size_t bytes = this->stream_info_.ms_to_bytes(this->stream_buffer_ms_);
     this->ring_buffer_ = ::esphome::RingBuffer::create(bytes);
     if (this->ring_buffer_ == nullptr) {
       ESP_LOGE(TAG, "Ring buffer allocate failed (%zu bytes)", bytes);
