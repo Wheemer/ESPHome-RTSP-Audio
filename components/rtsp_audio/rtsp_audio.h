@@ -105,8 +105,8 @@ class RtspAudioComponent : public Component {
   // exhaust the heap (and abort) on a no-PSRAM board. Interleaved RTP queueing
   // stops at MAX_RTP_BACKLOG_BYTES, leaving headroom for RTSP responses so the
   // buffer never has to grow past its reserved capacity.
-  static constexpr size_t TX_BUFFER_CAPACITY_BYTES = 8192;
-  static constexpr size_t MAX_RTP_BACKLOG_BYTES = 7168;
+  static constexpr size_t TX_BUFFER_CAPACITY_BYTES = 16384;
+  static constexpr size_t MAX_RTP_BACKLOG_BYTES = 14336;
 
   // RTSP session inactivity timeout. Advertised verbatim in SETUP's
   // `Session: ...;timeout=` field and enforced locally so the two can't
