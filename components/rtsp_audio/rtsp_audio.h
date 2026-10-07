@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "biquad.h"
 #include "dc_blocker.h"
@@ -19,6 +20,7 @@
 #include "gain.h"
 #include "high_cut_biquad.h"
 #include "low_cut_biquad.h"
+#include "pcm_conversion.h"
 #include "teardown_guard.h"
 
 #ifdef USE_BINARY_SENSOR
@@ -161,9 +163,12 @@ class RtspAudioComponent : public Component {
   uint8_t max_catchup_packets_{8};
   bool bypass_dsp_{false};
 
-  // Cached audio shape for the active microphone source.
+  // Cached source and outgoing RTP shapes. INMP441 uses 32-bit I2S slots,
+  // but RTP stays L16 so existing RTSP clients need no changes.
+  audio::AudioStreamInfo source_stream_info_{};
   audio::AudioStreamInfo stream_info_{};
   uint32_t samples_per_packet_{0};
+  std::vector<int16_t> pcm_conversion_buffer_;
 
   std::unique_ptr<ring_buffer::RingBuffer> ring_buffer_;
 

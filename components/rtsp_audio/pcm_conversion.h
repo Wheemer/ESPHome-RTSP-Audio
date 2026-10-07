@@ -1,0 +1,22 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+namespace esphome::rtsp_audio::internal {
+
+// ESPHome supplies standard I2S samples in host-endian, 32-bit PCM words.
+// INMP441 data is left-aligned in that word, so retaining the high 16 bits
+// produces the signed PCM16 representation used by RTP L16.
+inline size_t pcm_s32_to_s16(const uint8_t *input, size_t input_bytes, int16_t *output) {
+  const size_t samples = input_bytes / sizeof(int32_t);
+  for (size_t i = 0; i < samples; ++i) {
+    int32_t sample;
+    std::memcpy(&sample, input + i * sizeof(sample), sizeof(sample));
+    output[i] = static_cast<int16_t>(sample >> 16);
+  }
+  return samples;
+}
+
+}  // namespace esphome::rtsp_audio::internal

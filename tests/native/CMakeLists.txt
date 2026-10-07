@@ -35,6 +35,7 @@ add_executable(rtsp_audio_tests
   test_high_cut_biquad.cpp
   test_gain.cpp
   test_audio_pipeline.cpp
+  test_pcm_conversion.cpp
   test_teardown_guard.cpp
 )
 target_include_directories(rtsp_audio_tests PRIVATE ${RTSP_AUDIO_SRC_DIR})
