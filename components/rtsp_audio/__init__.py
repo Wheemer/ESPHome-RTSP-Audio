@@ -31,7 +31,7 @@ CONFIG_SCHEMA = cv.All(
                 min_bits_per_sample=16,
                 max_bits_per_sample=32,
                 min_channels=1,
-                max_channels=2,
+                max_channels=1,
             ),
         }
     ).extend(cv.COMPONENT_SCHEMA),

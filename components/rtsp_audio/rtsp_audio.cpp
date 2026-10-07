@@ -145,13 +145,11 @@ void RtspAudioComponent::setup() {
   }
 
   this->source_stream_info_ = this->mic_source_->get_audio_stream_info();
-  const uint8_t source_bits = this->source_stream_info_.get_bits_per_sample();
-  const uint8_t source_channels = this->source_stream_info_.get_channels();
-  const bool supported_shape = (source_bits == 16 && source_channels == 1) ||
-                               (source_bits == 32 && (source_channels == 1 || source_channels == 2));
   if ((this->source_stream_info_.get_sample_rate() != 16000 &&
        this->source_stream_info_.get_sample_rate() != 32000) ||
-      !supported_shape) {
+      this->source_stream_info_.get_channels() != 1 ||
+      (this->source_stream_info_.get_bits_per_sample() != 16 &&
+       this->source_stream_info_.get_bits_per_sample() != 32)) {
     ESP_LOGE(TAG, "Unsupported microphone stream: %lu Hz / %u ch / %u bit",
              static_cast<unsigned long>(this->source_stream_info_.get_sample_rate()),
              this->source_stream_info_.get_channels(), this->source_stream_info_.get_bits_per_sample());
@@ -319,17 +317,12 @@ void RtspAudioComponent::attach_mic_callback_() {
       return;
     }
 
-    const uint8_t channels = this->source_stream_info_.get_channels();
-    if (data.size() % (sizeof(int32_t) * channels) != 0 ||
-        data.size() / (sizeof(int32_t) * channels) > this->pcm_conversion_buffer_.size()) {
+    if (data.size() % sizeof(int32_t) != 0 ||
+        data.size() / sizeof(int32_t) > this->pcm_conversion_buffer_.size()) {
       ESP_LOGW(TAG, "Unexpected 32-bit microphone callback size: %zu bytes", data.size());
       return;
     }
-    // ESPHome emits stereo I2S as right then left. The Garage INMP441's L/R
-    // pin is grounded, so preserve the left slot and keep RTP mono.
-    const uint8_t channel_index = channels == 2 ? 1 : 0;
-    const size_t samples = internal::pcm_s32_to_s16(data.data(), data.size(), channels, channel_index,
-                                                     this->pcm_conversion_buffer_.data());
+    const size_t samples = internal::pcm_s32_to_s16(data.data(), data.size(), this->pcm_conversion_buffer_.data());
     this->ring_buffer_->write(this->pcm_conversion_buffer_.data(), this->stream_info_.samples_to_bytes(samples));
   });
 }
