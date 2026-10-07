@@ -271,6 +271,13 @@ void RtspAudioComponent::loop() {
   // RAII guard wraps the entire loop body so every exit path (including the
   // network-down early return) contributes to the cpu_use_pct accumulator.
   BusyScope busy{this->busy_usec_};
+  const int64_t loop_now = esp_timer_get_time();
+  if (this->last_loop_usec_ != 0) {
+    const int64_t gap = loop_now - this->last_loop_usec_;
+    if (gap > 0)
+      this->max_loop_gap_usec_ = std::max(this->max_loop_gap_usec_, static_cast<uint32_t>(gap));
+  }
+  this->last_loop_usec_ = loop_now;
   if (!network::is_connected() && this->control_socket_) {
     ESP_LOGW(TAG, "Network down; closing RTSP session");
     this->close_session_();
@@ -944,19 +951,22 @@ void RtspAudioComponent::log_stream_stats_(int64_t now) {
     }
     ESP_LOGI(TAG,
              "RTSP diag/10s: capture=%lu B, drained=%lu B, overwrite=%lu B, input-drop=%lu B, TCP-stalls=%lu, "
-             "catch-up=%lu, buffered=%zu B",
+             "catch-up=%lu, loop-gap=%lu ms, tx-high=%zu B, buffered=%zu B",
              static_cast<unsigned long>(mic_bytes - this->stats_last_mic_bytes_),
              static_cast<unsigned long>(this->rtp_payload_bytes_drained_ - this->stats_last_payload_bytes_drained_),
              static_cast<unsigned long>(overwrite_bytes - this->stats_last_overwrite_bytes_),
              static_cast<unsigned long>(input_drop_bytes - this->stats_last_input_drop_bytes_),
              static_cast<unsigned long>(this->tcp_backpressure_events_ - this->stats_last_tcp_backpressure_events_),
-             static_cast<unsigned long>(this->pacing_backlog_events_ - this->stats_last_pacing_backlog_events_), buffered);
+             static_cast<unsigned long>(this->pacing_backlog_events_ - this->stats_last_pacing_backlog_events_),
+             static_cast<unsigned long>(this->max_loop_gap_usec_ / 1000), this->max_tx_buffer_bytes_, buffered);
     this->stats_last_mic_bytes_ = mic_bytes;
     this->stats_last_overwrite_bytes_ = overwrite_bytes;
     this->stats_last_input_drop_bytes_ = input_drop_bytes;
     this->stats_last_payload_bytes_drained_ = this->rtp_payload_bytes_drained_;
     this->stats_last_tcp_backpressure_events_ = this->tcp_backpressure_events_;
     this->stats_last_pacing_backlog_events_ = this->pacing_backlog_events_;
+    this->max_loop_gap_usec_ = 0;
+    this->max_tx_buffer_bytes_ = this->tx_buffer_.size();
     this->last_diagnostic_usec_ = now;
   }
 
@@ -1111,6 +1121,7 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
                                                         static_cast<uint8_t>(packet_len & 0xFF)};
       this->tx_buffer_.append(reinterpret_cast<const char *>(framing), INTERLEAVE_HEADER_BYTES);
       this->tx_buffer_.append(reinterpret_cast<const char *>(header), packet_len);
+      this->max_tx_buffer_bytes_ = std::max(this->max_tx_buffer_bytes_, this->tx_buffer_.size());
       this->rtp_packets_sent_++;
       this->bytes_sent_ += packet_len;
       this->last_packet_usec_ = esp_timer_get_time();

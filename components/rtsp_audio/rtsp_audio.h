@@ -225,6 +225,9 @@ class RtspAudioComponent : public Component {
   bool tcp_backpressure_active_{false};
   uint32_t pacing_backlog_events_{0};
   bool pacing_backlog_active_{false};
+  int64_t last_loop_usec_{0};
+  uint32_t max_loop_gap_usec_{0};
+  size_t max_tx_buffer_bytes_{0};
 
   // Snapshots for the optional ten-second measurement log.
   uint32_t stats_last_mic_bytes_{0};
