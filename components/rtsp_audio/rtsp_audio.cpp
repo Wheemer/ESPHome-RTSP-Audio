@@ -186,6 +186,7 @@ void RtspAudioComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "RTSP audio:");
   ESP_LOGCONFIG(TAG, "  Listen port: %u", this->listen_port_);
   ESP_LOGCONFIG(TAG, "  Packet ms: %u", this->packet_duration_ms_);
+  ESP_LOGCONFIG(TAG, "  Diagnostics: %s", YESNO(this->diagnostics_enabled_));
   ESP_LOGCONFIG(TAG, "  Session timeout: %lus", static_cast<unsigned long>(SESSION_TIMEOUT_SECONDS));
   ESP_LOGCONFIG(TAG, "  Audio: %lu Hz / %u ch / %u bit, %lu samples/pkt",
                 static_cast<unsigned long>(this->stream_info_.get_sample_rate()), this->stream_info_.get_channels(),
@@ -296,14 +297,21 @@ void RtspAudioComponent::attach_mic_callback_() {
     BusyScope busy{this->busy_usec_};
     // Diagnostics: record what MicrophoneSource actually hands us, separate from
     // the RTP send path. Empty buffers mean the I2S layer read no audio.
-    this->mic_callbacks_++;
+    this->mic_callbacks_.fetch_add(1, std::memory_order_relaxed);
     if (data.empty()) {
-      this->mic_empty_callbacks_++;
+      this->mic_empty_callbacks_.fetch_add(1, std::memory_order_relaxed);
     } else {
-      this->mic_bytes_received_ += data.size();
+      this->mic_bytes_received_.fetch_add(data.size(), std::memory_order_relaxed);
     }
-    if (this->ring_buffer_ != nullptr)
-      this->ring_buffer_->write(data.data(), data.size());
+    LockGuard guard(this->ring_buffer_mutex_);
+    if (this->ring_buffer_ != nullptr && !data.empty()) {
+      const size_t free = this->ring_buffer_->free();
+      const size_t available = this->ring_buffer_->available();
+      const size_t overwritten = data.size() > free ? std::min(data.size() - free, available) : 0;
+      const size_t written = this->ring_buffer_->write(data.data(), data.size());
+      this->ring_overwrite_bytes_.fetch_add(overwritten, std::memory_order_relaxed);
+      this->ring_input_drop_bytes_.fetch_add(data.size() - written, std::memory_order_relaxed);
+    }
   });
 }
 
@@ -704,12 +712,24 @@ void RtspAudioComponent::start_streaming_() {
   this->bytes_sent_ = 0;
   this->stats_last_packets_ = 0;
   this->last_stats_usec_ = this->last_rtp_usec_;
+  this->last_diagnostic_usec_ = this->last_rtp_usec_;
   this->last_packet_usec_ = this->last_rtp_usec_;
   this->first_packet_logged_ = false;
   this->underrun_warned_ = false;
-  this->mic_callbacks_ = 0;
-  this->mic_empty_callbacks_ = 0;
-  this->mic_bytes_received_ = 0;
+  this->mic_callbacks_.store(0, std::memory_order_relaxed);
+  this->mic_empty_callbacks_.store(0, std::memory_order_relaxed);
+  this->mic_bytes_received_.store(0, std::memory_order_relaxed);
+  this->ring_overwrite_bytes_.store(0, std::memory_order_relaxed);
+  this->ring_input_drop_bytes_.store(0, std::memory_order_relaxed);
+  this->rtp_payload_bytes_drained_ = 0;
+  this->tcp_backlog_dropped_packets_ = 0;
+  this->pacing_resyncs_ = 0;
+  this->stats_last_mic_bytes_ = 0;
+  this->stats_last_overwrite_bytes_ = 0;
+  this->stats_last_input_drop_bytes_ = 0;
+  this->stats_last_payload_bytes_drained_ = 0;
+  this->stats_last_tcp_backlog_dropped_packets_ = 0;
+  this->stats_last_pacing_resyncs_ = 0;
   // Reset CPU-use bookkeeping so the first window starts at PLAY, not at
   // boot — otherwise the first published value would average in any idle
   // time the device sat with no client connected.
@@ -856,6 +876,7 @@ void RtspAudioComponent::maybe_send_rtp_() {
   if (sent == this->max_catchup_packets_ &&
       now - this->last_rtp_usec_ > static_cast<int64_t>(this->rtp_interval_usec_)) {
     ESP_LOGW(TAG, "RTP pacing behind by >%u packets; resyncing", this->max_catchup_packets_);
+    this->pacing_resyncs_++;
     this->last_rtp_usec_ = now;
   }
 
@@ -889,13 +910,41 @@ void RtspAudioComponent::log_stream_stats_(int64_t now) {
                "activity) and is harmless once the stream recovers. If the totals are frozen, the "
                "microphone stopped: 0 callbacks = MicrophoneSource not delivering; callbacks but "
                "0 bytes = I2S read no audio.",
-               static_cast<unsigned long>(this->mic_callbacks_),
-               static_cast<unsigned long>(this->mic_empty_callbacks_),
-               static_cast<unsigned long>(this->mic_bytes_received_),
+               static_cast<unsigned long>(this->mic_callbacks_.load(std::memory_order_relaxed)),
+               static_cast<unsigned long>(this->mic_empty_callbacks_.load(std::memory_order_relaxed)),
+               static_cast<unsigned long>(this->mic_bytes_received_.load(std::memory_order_relaxed)),
                this->ring_buffer_->available());
     }
   } else {
     this->underrun_warned_ = false;
+  }
+
+  if (this->diagnostics_enabled_ && now - this->last_diagnostic_usec_ >= 10'000'000) {
+    const uint32_t mic_bytes = this->mic_bytes_received_.load(std::memory_order_relaxed);
+    const uint32_t overwrite_bytes = this->ring_overwrite_bytes_.load(std::memory_order_relaxed);
+    const uint32_t input_drop_bytes = this->ring_input_drop_bytes_.load(std::memory_order_relaxed);
+    size_t buffered = 0;
+    {
+      LockGuard guard(this->ring_buffer_mutex_);
+      if (this->ring_buffer_ != nullptr)
+        buffered = this->ring_buffer_->available();
+    }
+    ESP_LOGI(TAG,
+             "RTSP diag/10s: capture=%lu B, drained=%lu B, overwrite=%lu B, input-drop=%lu B, TCP-drop=%lu pkts, "
+             "resync=%lu, buffered=%zu B",
+             static_cast<unsigned long>(mic_bytes - this->stats_last_mic_bytes_),
+             static_cast<unsigned long>(this->rtp_payload_bytes_drained_ - this->stats_last_payload_bytes_drained_),
+             static_cast<unsigned long>(overwrite_bytes - this->stats_last_overwrite_bytes_),
+             static_cast<unsigned long>(input_drop_bytes - this->stats_last_input_drop_bytes_),
+             static_cast<unsigned long>(this->tcp_backlog_dropped_packets_ - this->stats_last_tcp_backlog_dropped_packets_),
+             static_cast<unsigned long>(this->pacing_resyncs_ - this->stats_last_pacing_resyncs_), buffered);
+    this->stats_last_mic_bytes_ = mic_bytes;
+    this->stats_last_overwrite_bytes_ = overwrite_bytes;
+    this->stats_last_input_drop_bytes_ = input_drop_bytes;
+    this->stats_last_payload_bytes_drained_ = this->rtp_payload_bytes_drained_;
+    this->stats_last_tcp_backlog_dropped_packets_ = this->tcp_backlog_dropped_packets_;
+    this->stats_last_pacing_resyncs_ = this->pacing_resyncs_;
+    this->last_diagnostic_usec_ = now;
   }
 
   // Periodic throughput so a healthy stream is visible in the log and a stalled
@@ -904,8 +953,9 @@ void RtspAudioComponent::log_stream_stats_(int64_t now) {
   if (now - this->last_stats_usec_ >= 5'000'000) {
     const uint32_t pkts = this->rtp_packets_sent_ - this->stats_last_packets_;
     ESP_LOGD(TAG, "RTP stream: %lu packets/5s; mic: %lu callbacks, %lu empty, %lu bytes; ring buffer %zu bytes",
-             static_cast<unsigned long>(pkts), static_cast<unsigned long>(this->mic_callbacks_),
-             static_cast<unsigned long>(this->mic_empty_callbacks_), static_cast<unsigned long>(this->mic_bytes_received_),
+             static_cast<unsigned long>(pkts), static_cast<unsigned long>(this->mic_callbacks_.load(std::memory_order_relaxed)),
+             static_cast<unsigned long>(this->mic_empty_callbacks_.load(std::memory_order_relaxed)),
+             static_cast<unsigned long>(this->mic_bytes_received_.load(std::memory_order_relaxed)),
              this->ring_buffer_->available());
     this->last_stats_usec_ = now;
     this->stats_last_packets_ = this->rtp_packets_sent_;
@@ -983,15 +1033,18 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
   // available consumes and discards a partial packet, so the buffer can never
   // accumulate a full one. Without this guard the send path drains the buffer
   // every loop and RTP stalls at 0 packets even though the mic delivers audio.
-  if (this->ring_buffer_->available() < payload_bytes)
-    return false;
-
   uint8_t *header = this->rtp_packet_;
   uint8_t *payload = header + RTP_HEADER_BYTES;
+  {
+    LockGuard guard(this->ring_buffer_mutex_);
+    if (this->ring_buffer_->available() < payload_bytes)
+      return false;
 
-  // Pull host-endian (little-endian on ESP32) PCM straight into the payload area.
-  if (this->ring_buffer_->read(payload, payload_bytes, 0) < payload_bytes)
-    return false;
+    // Pull host-endian (little-endian on ESP32) PCM straight into the payload area.
+    if (this->ring_buffer_->read(payload, payload_bytes, 0) < payload_bytes)
+      return false;
+  }
+  this->rtp_payload_bytes_drained_ += payload_bytes;
 
   // Write RTP header in network byte order using the standard ESPHome helper.
   header[0] = 0x80;  // V=2, P=0, X=0, CC=0
@@ -1041,6 +1094,8 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
       this->rtp_packets_sent_++;
       this->bytes_sent_ += packet_len;
       this->last_packet_usec_ = esp_timer_get_time();
+    } else {
+      this->tcp_backlog_dropped_packets_++;
     }
     this->rtp_seq_++;
     this->rtp_ts_ += this->samples_per_packet_;

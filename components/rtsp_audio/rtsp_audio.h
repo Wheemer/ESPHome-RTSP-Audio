@@ -52,6 +52,7 @@ class RtspAudioComponent : public Component {
   void set_stream_buffer_ms(uint16_t ms) { this->stream_buffer_ms_ = ms; }
   void set_max_catchup_packets(uint8_t packets) { this->max_catchup_packets_ = packets; }
   void set_bypass_dsp(bool bypass) { this->bypass_dsp_ = bypass; }
+  void set_diagnostics_enabled(bool enabled) { this->diagnostics_enabled_ = enabled; }
 
   /// Updates the low-cut filter frequency (in Hz) at runtime. Called
   /// from the bundled `number` platform when the HA slider moves and
@@ -160,12 +161,14 @@ class RtspAudioComponent : public Component {
   uint16_t stream_buffer_ms_{1000};
   uint8_t max_catchup_packets_{8};
   bool bypass_dsp_{false};
+  bool diagnostics_enabled_{false};
 
   // Cached audio shape for the active microphone source.
   audio::AudioStreamInfo stream_info_{};
   uint32_t samples_per_packet_{0};
 
   std::unique_ptr<ring_buffer::RingBuffer> ring_buffer_;
+  Mutex ring_buffer_mutex_;
 
   // Sockets.
   std::unique_ptr<socket::Socket> listen_socket_;
@@ -205,15 +208,29 @@ class RtspAudioComponent : public Component {
   uint32_t bytes_sent_{0};
   uint32_t stats_last_packets_{0};
   int64_t last_stats_usec_{0};
+  int64_t last_diagnostic_usec_{0};
   int64_t last_packet_usec_{0};
   bool first_packet_logged_{false};
   bool underrun_warned_{false};
 
   // Microphone delivery diagnostics — counts what arrives from MicrophoneSource,
   // independent of the RTP send path, to pinpoint where the audio chain breaks.
-  uint32_t mic_callbacks_{0};
-  uint32_t mic_empty_callbacks_{0};
-  uint32_t mic_bytes_received_{0};
+  std::atomic<uint32_t> mic_callbacks_{0};
+  std::atomic<uint32_t> mic_empty_callbacks_{0};
+  std::atomic<uint32_t> mic_bytes_received_{0};
+  std::atomic<uint32_t> ring_overwrite_bytes_{0};
+  std::atomic<uint32_t> ring_input_drop_bytes_{0};
+  uint32_t rtp_payload_bytes_drained_{0};
+  uint32_t tcp_backlog_dropped_packets_{0};
+  uint32_t pacing_resyncs_{0};
+
+  // Snapshots for the optional ten-second measurement log.
+  uint32_t stats_last_mic_bytes_{0};
+  uint32_t stats_last_overwrite_bytes_{0};
+  uint32_t stats_last_input_drop_bytes_{0};
+  uint32_t stats_last_payload_bytes_drained_{0};
+  uint32_t stats_last_tcp_backlog_dropped_packets_{0};
+  uint32_t stats_last_pacing_resyncs_{0};
 
   // DC blocker (1-pole HP at a fixed 5 Hz). Sits upstream of every
   // other DSP stage — always on, not user-configurable. Kills the
