@@ -29,7 +29,7 @@ CONFIG_SCHEMA = cv.All(
                 CONF_MICROPHONE, default={}
             ): microphone.microphone_source_schema(
                 min_bits_per_sample=16,
-                max_bits_per_sample=32,
+                max_bits_per_sample=16,
                 min_channels=1,
                 max_channels=1,
             ),

@@ -144,24 +144,17 @@ void RtspAudioComponent::setup() {
     return;
   }
 
-  this->source_stream_info_ = this->mic_source_->get_audio_stream_info();
-  if ((this->source_stream_info_.get_sample_rate() != 16000 &&
-       this->source_stream_info_.get_sample_rate() != 32000) ||
-      this->source_stream_info_.get_channels() != 1 ||
-      (this->source_stream_info_.get_bits_per_sample() != 16 &&
-       this->source_stream_info_.get_bits_per_sample() != 32)) {
+  this->stream_info_ = this->mic_source_->get_audio_stream_info();
+  // The component streams the source rate in its SDP. Garage uses its proven
+  // 16 kHz I2S capture path; 32 kHz remains supported for existing installs.
+  if ((this->stream_info_.get_sample_rate() != 16000 && this->stream_info_.get_sample_rate() != 32000) ||
+      this->stream_info_.get_channels() != 1 ||
+      this->stream_info_.get_bits_per_sample() != 16) {
     ESP_LOGE(TAG, "Unsupported microphone stream: %lu Hz / %u ch / %u bit",
-             static_cast<unsigned long>(this->source_stream_info_.get_sample_rate()),
-             this->source_stream_info_.get_channels(), this->source_stream_info_.get_bits_per_sample());
+             static_cast<unsigned long>(this->stream_info_.get_sample_rate()),
+             this->stream_info_.get_channels(), this->stream_info_.get_bits_per_sample());
     this->mark_failed();
     return;
-  }
-
-  this->stream_info_ = audio::AudioStreamInfo(16, 1, this->source_stream_info_.get_sample_rate());
-  if (this->source_stream_info_.get_bits_per_sample() == 32) {
-    // ESPHome's I2S microphone task supplies 16 ms reads. Allocate once at
-    // setup so conversion never allocates from the real-time callback.
-    this->pcm_conversion_buffer_.resize(this->source_stream_info_.ms_to_samples(16));
   }
 
   this->samples_per_packet_ = this->stream_info_.ms_to_samples(this->packet_duration_ms_);
@@ -309,21 +302,8 @@ void RtspAudioComponent::attach_mic_callback_() {
     } else {
       this->mic_bytes_received_ += data.size();
     }
-    if (this->ring_buffer_ == nullptr)
-      return;
-
-    if (this->source_stream_info_.get_bits_per_sample() == 16) {
+    if (this->ring_buffer_ != nullptr)
       this->ring_buffer_->write(data.data(), data.size());
-      return;
-    }
-
-    if (data.size() % sizeof(int32_t) != 0 ||
-        data.size() / sizeof(int32_t) > this->pcm_conversion_buffer_.size()) {
-      ESP_LOGW(TAG, "Unexpected 32-bit microphone callback size: %zu bytes", data.size());
-      return;
-    }
-    const size_t samples = internal::pcm_s32_to_s16(data.data(), data.size(), this->pcm_conversion_buffer_.data());
-    this->ring_buffer_->write(this->pcm_conversion_buffer_.data(), this->stream_info_.samples_to_bytes(samples));
   });
 }
 
