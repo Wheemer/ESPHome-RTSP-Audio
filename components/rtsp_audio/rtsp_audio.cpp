@@ -728,13 +728,14 @@ void RtspAudioComponent::start_streaming_() {
   this->rtp_payload_bytes_drained_ = 0;
   this->tcp_backpressure_events_ = 0;
   this->tcp_backpressure_active_ = false;
-  this->pacing_resyncs_ = 0;
+  this->pacing_backlog_events_ = 0;
+  this->pacing_backlog_active_ = false;
   this->stats_last_mic_bytes_ = 0;
   this->stats_last_overwrite_bytes_ = 0;
   this->stats_last_input_drop_bytes_ = 0;
   this->stats_last_payload_bytes_drained_ = 0;
   this->stats_last_tcp_backpressure_events_ = 0;
-  this->stats_last_pacing_resyncs_ = 0;
+  this->stats_last_pacing_backlog_events_ = 0;
   // Reset CPU-use bookkeeping so the first window starts at PLAY, not at
   // boot — otherwise the first published value would average in any idle
   // time the device sat with no client connected.
@@ -875,14 +876,18 @@ void RtspAudioComponent::maybe_send_rtp_() {
     sent++;
   }
 
-  // Hit the configured per-loop cap and still behind (a long stall, e.g. a flash write).
-  // Snap the deadline to now so we don't burst the backlog every loop
-  // indefinitely; the backlog is dropped in favour of staying near real time.
+  // Hit the configured per-loop cap and remain behind after a long stall.
+  // Keep the deadline intact: later loop iterations continue the bounded
+  // catch-up rather than silently deleting delayed audio.
   if (sent == this->max_catchup_packets_ &&
       now - this->last_rtp_usec_ > static_cast<int64_t>(this->rtp_interval_usec_)) {
-    ESP_LOGW(TAG, "RTP pacing behind by >%u packets; resyncing", this->max_catchup_packets_);
-    this->pacing_resyncs_++;
-    this->last_rtp_usec_ = now;
+    if (!this->pacing_backlog_active_) {
+      ESP_LOGW(TAG, "RTP pacing behind by >%u packets; retaining backlog", this->max_catchup_packets_);
+      this->pacing_backlog_events_++;
+      this->pacing_backlog_active_ = true;
+    }
+  } else {
+    this->pacing_backlog_active_ = false;
   }
 
   this->log_stream_stats_(now);
@@ -936,19 +941,19 @@ void RtspAudioComponent::log_stream_stats_(int64_t now) {
     }
     ESP_LOGI(TAG,
              "RTSP diag/10s: capture=%lu B, drained=%lu B, overwrite=%lu B, input-drop=%lu B, TCP-stalls=%lu, "
-             "resync=%lu, buffered=%zu B",
+             "catch-up=%lu, buffered=%zu B",
              static_cast<unsigned long>(mic_bytes - this->stats_last_mic_bytes_),
              static_cast<unsigned long>(this->rtp_payload_bytes_drained_ - this->stats_last_payload_bytes_drained_),
              static_cast<unsigned long>(overwrite_bytes - this->stats_last_overwrite_bytes_),
              static_cast<unsigned long>(input_drop_bytes - this->stats_last_input_drop_bytes_),
              static_cast<unsigned long>(this->tcp_backpressure_events_ - this->stats_last_tcp_backpressure_events_),
-             static_cast<unsigned long>(this->pacing_resyncs_ - this->stats_last_pacing_resyncs_), buffered);
+             static_cast<unsigned long>(this->pacing_backlog_events_ - this->stats_last_pacing_backlog_events_), buffered);
     this->stats_last_mic_bytes_ = mic_bytes;
     this->stats_last_overwrite_bytes_ = overwrite_bytes;
     this->stats_last_input_drop_bytes_ = input_drop_bytes;
     this->stats_last_payload_bytes_drained_ = this->rtp_payload_bytes_drained_;
     this->stats_last_tcp_backpressure_events_ = this->tcp_backpressure_events_;
-    this->stats_last_pacing_resyncs_ = this->pacing_resyncs_;
+    this->stats_last_pacing_backlog_events_ = this->pacing_backlog_events_;
     this->last_diagnostic_usec_ = now;
   }
 
