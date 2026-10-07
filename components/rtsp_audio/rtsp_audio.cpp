@@ -145,9 +145,10 @@ void RtspAudioComponent::setup() {
   }
 
   this->stream_info_ = this->mic_source_->get_audio_stream_info();
-  // FINAL_VALIDATE_SCHEMA already fixes this to 32 kHz mono 16-bit, but a runtime
-  // guard keeps the audio math honest if someone bypasses validation.
-  if (this->stream_info_.get_sample_rate() != 32000 || this->stream_info_.get_channels() != 1 ||
+  // The component streams the source rate in its SDP. Garage uses its proven
+  // 16 kHz I2S capture path; 32 kHz remains supported for existing installs.
+  if ((this->stream_info_.get_sample_rate() != 16000 && this->stream_info_.get_sample_rate() != 32000) ||
+      this->stream_info_.get_channels() != 1 ||
       this->stream_info_.get_bits_per_sample() != 16) {
     ESP_LOGE(TAG, "Unsupported microphone stream: %u Hz / %u ch / %u bit", this->stream_info_.get_sample_rate(),
              this->stream_info_.get_channels(), this->stream_info_.get_bits_per_sample());
@@ -165,6 +166,10 @@ void RtspAudioComponent::setup() {
   // For mono audio one frame == one sample, so the call below matches the per-packet duration exactly.
   this->rtp_interval_usec_ = this->stream_info_.frames_to_microseconds(this->samples_per_packet_);
   this->rtp_packet_size_ = RTP_HEADER_BYTES + this->stream_info_.samples_to_bytes(this->samples_per_packet_);
+
+  // Member defaults are calculated for 32 kHz. Recompute the active low-cut
+  // coefficients from the actual microphone rate before streaming begins.
+  this->set_low_cut_frequency_hz(this->lowcut_filter_frequency_hz_);
 
   this->attach_mic_callback_();
 
