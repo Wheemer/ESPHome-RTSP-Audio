@@ -186,7 +186,7 @@ void RtspAudioComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "RTSP audio:");
   ESP_LOGCONFIG(TAG, "  Listen port: %u", this->listen_port_);
   ESP_LOGCONFIG(TAG, "  Packet ms: %u", this->packet_duration_ms_);
-  ESP_LOGCONFIG(TAG, "  Session timeout: %us", SESSION_TIMEOUT_SECONDS);
+  ESP_LOGCONFIG(TAG, "  Session timeout: %lus", static_cast<unsigned long>(SESSION_TIMEOUT_SECONDS));
   ESP_LOGCONFIG(TAG, "  Audio: %lu Hz / %u ch / %u bit, %lu samples/pkt",
                 static_cast<unsigned long>(this->stream_info_.get_sample_rate()), this->stream_info_.get_channels(),
                 this->stream_info_.get_bits_per_sample(), static_cast<unsigned long>(this->samples_per_packet_));
@@ -579,9 +579,10 @@ bool RtspAudioComponent::handle_rtsp_message_(const std::string &request) {
       this->rtp_channel_ = tr.rtp_channel;
       this->rtp_socket_.reset();
       this->send_rtsp_response_(
-          str_sprintf("RTSP/1.0 200 OK\r\n%sSession: %u;timeout=%u\r\n"
+          str_sprintf("RTSP/1.0 200 OK\r\n%sSession: %lu;timeout=%lu\r\n"
                       "Transport: RTP/AVP/TCP;unicast;interleaved=%u-%u\r\n\r\n",
-                      cseq_hdr.c_str(), this->session_id_, SESSION_TIMEOUT_SECONDS,
+                      cseq_hdr.c_str(), static_cast<unsigned long>(this->session_id_),
+                      static_cast<unsigned long>(SESSION_TIMEOUT_SECONDS),
                       static_cast<unsigned>(tr.rtp_channel), static_cast<unsigned>(tr.rtcp_channel)));
       this->session_active_ = true;
       this->publish_session_state_();
@@ -635,10 +636,12 @@ bool RtspAudioComponent::handle_rtsp_message_(const std::string &request) {
       this->server_rtp_port_ = ntohs(reinterpret_cast<sockaddr_in *>(&local)->sin_port);
 
     this->send_rtsp_response_(
-        str_sprintf("RTSP/1.0 200 OK\r\n%sSession: %u;timeout=%u\r\n"
+        str_sprintf("RTSP/1.0 200 OK\r\n%sSession: %lu;timeout=%lu\r\n"
                     "Transport: RTP/AVP;unicast;client_port=%u-%u;server_port=%u-%u\r\n\r\n",
-                    cseq_hdr.c_str(), this->session_id_, SESSION_TIMEOUT_SECONDS, tr.client_rtp_port,
-                    tr.client_rtcp_port, this->server_rtp_port_, this->server_rtp_port_ + 1));
+                    cseq_hdr.c_str(), static_cast<unsigned long>(this->session_id_),
+                    static_cast<unsigned long>(SESSION_TIMEOUT_SECONDS), static_cast<unsigned>(tr.client_rtp_port),
+                    static_cast<unsigned>(tr.client_rtcp_port), static_cast<unsigned>(this->server_rtp_port_),
+                    static_cast<unsigned>(this->server_rtp_port_ + 1)));
     this->session_active_ = true;
     this->publish_session_state_();
     return true;
@@ -656,15 +659,16 @@ bool RtspAudioComponent::handle_rtsp_message_(const std::string &request) {
       rtp_info = str_sprintf("RTP-Info: url=%s;seq=%u;rtptime=%u\r\n", this->track_url_.c_str(),
                              static_cast<unsigned>(this->rtp_seq_), static_cast<unsigned>(this->rtp_ts_));
     }
-    this->send_rtsp_response_(str_sprintf("RTSP/1.0 200 OK\r\n%sSession: %u\r\n%s\r\n", cseq_hdr.c_str(),
-                                          this->session_id_, rtp_info.c_str()));
+    this->send_rtsp_response_(str_sprintf("RTSP/1.0 200 OK\r\n%sSession: %lu\r\n%s\r\n", cseq_hdr.c_str(),
+                                          static_cast<unsigned long>(this->session_id_), rtp_info.c_str()));
     return true;
   }
 
   if (method == "pause") {
     this->stop_streaming_();
     this->send_rtsp_response_(
-        str_sprintf("RTSP/1.0 200 OK\r\n%sSession: %u\r\n\r\n", cseq_hdr.c_str(), this->session_id_));
+        str_sprintf("RTSP/1.0 200 OK\r\n%sSession: %lu\r\n\r\n", cseq_hdr.c_str(),
+                    static_cast<unsigned long>(this->session_id_)));
     return true;
   }
 
@@ -817,7 +821,7 @@ void RtspAudioComponent::publish_session_state_() {
 void RtspAudioComponent::check_session_inactivity_() {
   if (!internal::session_is_idle(esp_timer_get_time(), this->last_rtsp_activity_usec_, SESSION_TIMEOUT_SECONDS))
     return;
-  ESP_LOGW(TAG, "RTSP session idle > %us; closing", SESSION_TIMEOUT_SECONDS);
+  ESP_LOGW(TAG, "RTSP session idle > %lus; closing", static_cast<unsigned long>(SESSION_TIMEOUT_SECONDS));
   this->close_session_();
 }
 
