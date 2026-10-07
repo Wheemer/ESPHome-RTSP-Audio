@@ -221,7 +221,8 @@ class RtspAudioComponent : public Component {
   std::atomic<uint32_t> ring_overwrite_bytes_{0};
   std::atomic<uint32_t> ring_input_drop_bytes_{0};
   uint32_t rtp_payload_bytes_drained_{0};
-  uint32_t tcp_backlog_dropped_packets_{0};
+  uint32_t tcp_backpressure_events_{0};
+  bool tcp_backpressure_active_{false};
   uint32_t pacing_resyncs_{0};
 
   // Snapshots for the optional ten-second measurement log.
@@ -229,7 +230,7 @@ class RtspAudioComponent : public Component {
   uint32_t stats_last_overwrite_bytes_{0};
   uint32_t stats_last_input_drop_bytes_{0};
   uint32_t stats_last_payload_bytes_drained_{0};
-  uint32_t stats_last_tcp_backlog_dropped_packets_{0};
+  uint32_t stats_last_tcp_backpressure_events_{0};
   uint32_t stats_last_pacing_resyncs_{0};
 
   // DC blocker (1-pole HP at a fixed 5 Hz). Sits upstream of every

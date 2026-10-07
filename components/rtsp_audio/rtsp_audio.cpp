@@ -282,6 +282,10 @@ void RtspAudioComponent::loop() {
     this->drain_control_socket_();
   if (this->control_socket_)
     this->check_session_inactivity_();
+  // Give pending TCP-interleaved media a chance to leave before deciding
+  // whether another RTP packet fits. This avoids treating ordinary socket
+  // backpressure as an audio-loss condition.
+  this->flush_tx_buffer_();
   this->maybe_send_rtp_();
   this->flush_tx_buffer_();
   if (this->mic_source_ != nullptr && this->teardown_guard_.poll(this->mic_source_->is_stopped())) {
@@ -722,13 +726,14 @@ void RtspAudioComponent::start_streaming_() {
   this->ring_overwrite_bytes_.store(0, std::memory_order_relaxed);
   this->ring_input_drop_bytes_.store(0, std::memory_order_relaxed);
   this->rtp_payload_bytes_drained_ = 0;
-  this->tcp_backlog_dropped_packets_ = 0;
+  this->tcp_backpressure_events_ = 0;
+  this->tcp_backpressure_active_ = false;
   this->pacing_resyncs_ = 0;
   this->stats_last_mic_bytes_ = 0;
   this->stats_last_overwrite_bytes_ = 0;
   this->stats_last_input_drop_bytes_ = 0;
   this->stats_last_payload_bytes_drained_ = 0;
-  this->stats_last_tcp_backlog_dropped_packets_ = 0;
+  this->stats_last_tcp_backpressure_events_ = 0;
   this->stats_last_pacing_resyncs_ = 0;
   // Reset CPU-use bookkeeping so the first window starts at PLAY, not at
   // boot — otherwise the first published value would average in any idle
@@ -930,19 +935,19 @@ void RtspAudioComponent::log_stream_stats_(int64_t now) {
         buffered = this->ring_buffer_->available();
     }
     ESP_LOGI(TAG,
-             "RTSP diag/10s: capture=%lu B, drained=%lu B, overwrite=%lu B, input-drop=%lu B, TCP-drop=%lu pkts, "
+             "RTSP diag/10s: capture=%lu B, drained=%lu B, overwrite=%lu B, input-drop=%lu B, TCP-stalls=%lu, "
              "resync=%lu, buffered=%zu B",
              static_cast<unsigned long>(mic_bytes - this->stats_last_mic_bytes_),
              static_cast<unsigned long>(this->rtp_payload_bytes_drained_ - this->stats_last_payload_bytes_drained_),
              static_cast<unsigned long>(overwrite_bytes - this->stats_last_overwrite_bytes_),
              static_cast<unsigned long>(input_drop_bytes - this->stats_last_input_drop_bytes_),
-             static_cast<unsigned long>(this->tcp_backlog_dropped_packets_ - this->stats_last_tcp_backlog_dropped_packets_),
+             static_cast<unsigned long>(this->tcp_backpressure_events_ - this->stats_last_tcp_backpressure_events_),
              static_cast<unsigned long>(this->pacing_resyncs_ - this->stats_last_pacing_resyncs_), buffered);
     this->stats_last_mic_bytes_ = mic_bytes;
     this->stats_last_overwrite_bytes_ = overwrite_bytes;
     this->stats_last_input_drop_bytes_ = input_drop_bytes;
     this->stats_last_payload_bytes_drained_ = this->rtp_payload_bytes_drained_;
-    this->stats_last_tcp_backlog_dropped_packets_ = this->tcp_backlog_dropped_packets_;
+    this->stats_last_tcp_backpressure_events_ = this->tcp_backpressure_events_;
     this->stats_last_pacing_resyncs_ = this->pacing_resyncs_;
     this->last_diagnostic_usec_ = now;
   }
@@ -1035,6 +1040,15 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
   // every loop and RTP stalls at 0 packets even though the mic delivers audio.
   uint8_t *header = this->rtp_packet_;
   uint8_t *payload = header + RTP_HEADER_BYTES;
+  const size_t packet_len = RTP_HEADER_BYTES + payload_bytes;
+  if (this->interleaved_ &&
+      this->tx_buffer_.size() + INTERLEAVE_HEADER_BYTES + packet_len > MAX_RTP_BACKLOG_BYTES) {
+    if (!this->tcp_backpressure_active_) {
+      this->tcp_backpressure_events_++;
+      this->tcp_backpressure_active_ = true;
+    }
+    return false;
+  }
   {
     LockGuard guard(this->ring_buffer_mutex_);
     if (this->ring_buffer_->available() < payload_bytes)
@@ -1045,6 +1059,7 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
       return false;
   }
   this->rtp_payload_bytes_drained_ += payload_bytes;
+  this->tcp_backpressure_active_ = false;
 
   // Write RTP header in network byte order using the standard ESPHome helper.
   header[0] = 0x80;  // V=2, P=0, X=0, CC=0
@@ -1078,13 +1093,10 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
   (void)packet_peak_abs;
 #endif
 
-  const size_t packet_len = RTP_HEADER_BYTES + payload_bytes;
-
   if (this->interleaved_) {
     // Frame the packet on the RTSP TCP connection: '$' + channel + 16-bit
-    // length + RTP. If the client is not draining the socket, drop whole
-    // packets (never a partial one — that would corrupt the framing) but still
-    // advance seq/ts so the receiver sees an ordinary loss rather than a stall.
+    // length + RTP. Queue capacity was checked before consuming PCM above, so
+    // a full TCP buffer defers this packet intact for a later loop iteration.
     if (this->tx_buffer_.size() + INTERLEAVE_HEADER_BYTES + packet_len <= MAX_RTP_BACKLOG_BYTES) {
       const uint8_t framing[INTERLEAVE_HEADER_BYTES] = {'$', this->rtp_channel_,
                                                         static_cast<uint8_t>((packet_len >> 8) & 0xFF),
@@ -1094,8 +1106,6 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
       this->rtp_packets_sent_++;
       this->bytes_sent_ += packet_len;
       this->last_packet_usec_ = esp_timer_get_time();
-    } else {
-      this->tcp_backlog_dropped_packets_++;
     }
     this->rtp_seq_++;
     this->rtp_ts_ += this->samples_per_packet_;
