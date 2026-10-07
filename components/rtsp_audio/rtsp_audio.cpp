@@ -995,10 +995,14 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
   // byteswap) in one pass over the payload. The pipeline header
   // centralises the stage order so future stages (soft limiter, gain
   // smoothing) don't touch this file.
-  const uint16_t packet_peak_abs = internal::process_l16_payload_inplace(
-      reinterpret_cast<int16_t *>(payload), this->samples_per_packet_, this->dc_blocker_state_, this->lowcut_state_,
-      this->lowcut_coeffs_, this->lowcut_bypass_, this->highcut_state_, this->highcut_coeffs_, this->highcut_bypass_,
-      this->gain_q8_.load(std::memory_order_relaxed));
+  const uint16_t packet_peak_abs = this->bypass_dsp_
+                                       ? internal::byteswap_l16_payload_inplace(reinterpret_cast<int16_t *>(payload),
+                                                                                 this->samples_per_packet_)
+                                       : internal::process_l16_payload_inplace(
+                                             reinterpret_cast<int16_t *>(payload), this->samples_per_packet_,
+                                             this->dc_blocker_state_, this->lowcut_state_, this->lowcut_coeffs_,
+                                             this->lowcut_bypass_, this->highcut_state_, this->highcut_coeffs_,
+                                             this->highcut_bypass_, this->gain_q8_.load(std::memory_order_relaxed));
 #ifdef USE_SENSOR
   // One compare per packet (~50 Hz) regardless of sample rate — the
   // per-sample work is already inside the pipeline. Window resets in

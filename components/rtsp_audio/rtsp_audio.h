@@ -50,6 +50,7 @@ class RtspAudioComponent : public Component {
   void set_listen_port(uint16_t port) { this->listen_port_ = port; }
   void set_packet_duration_ms(uint16_t ms) { this->packet_duration_ms_ = ms; }
   void set_stream_buffer_ms(uint16_t ms) { this->stream_buffer_ms_ = ms; }
+  void set_bypass_dsp(bool bypass) { this->bypass_dsp_ = bypass; }
 
   /// Updates the low-cut filter frequency (in Hz) at runtime. Called
   /// from the bundled `number` platform when the HA slider moves and
@@ -156,6 +157,7 @@ class RtspAudioComponent : public Component {
   uint16_t listen_port_{8554};
   uint16_t packet_duration_ms_{20};
   uint16_t stream_buffer_ms_{1000};
+  bool bypass_dsp_{false};
 
   // Cached audio shape for the active microphone source.
   audio::AudioStreamInfo stream_info_{};
