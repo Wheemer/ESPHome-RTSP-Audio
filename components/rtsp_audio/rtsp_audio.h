@@ -106,10 +106,11 @@ class RtspAudioComponent : public Component {
   // stops at MAX_RTP_BACKLOG_BYTES, leaving headroom for RTSP responses so the
   // buffer never has to grow past its reserved capacity.
   static constexpr size_t TX_BUFFER_CAPACITY_BYTES = 16384;
-  // Keep no more than about three 20 ms L16 packets pending. RTSP over TCP
-  // must preserve byte order, but keeping a large backlog turns a short
-  // receiver stall into delayed, discontinuous audio when it recovers.
-  static constexpr size_t MAX_RTP_BACKLOG_BYTES = 2048;
+  // Allow a short, bounded 240 ms TCP scheduling delay (twelve 20 ms L16
+  // packets). Three packets was so tight that normal TCP scheduling repeatedly
+  // triggered the stale-audio drop policy. Longer stalls still discard capture
+  // data at the source rather than replaying delayed audio.
+  static constexpr size_t MAX_RTP_BACKLOG_BYTES = 8192;
 
   // Networking lifecycle.
   void start_listen_socket_();
