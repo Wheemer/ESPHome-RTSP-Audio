@@ -208,8 +208,7 @@ void RTSPAudioComponent::server_task_() {
 
       ESP_LOGI(TAG, "RTSP client session %d connected from %s:%u", session_index, peer_ip, ntohs(peer.sin_port));
       auto *arg = new ClientTaskArg{this, cfd, session_index};
-      char task_name[20];
-      snprintf(task_name, sizeof(task_name), "rtsp_audio_c%d", session_index);
+      const char *task_name = "rtsp_audio_cli";
       BaseType_t ok = xTaskCreatePinnedToCore(&RTSPAudioComponent::client_task_trampoline_, task_name, RTSP_TASK_STACK_BYTES, arg, 5, nullptr, 0);
       if (ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create RTSP client task for session %d", session_index);
