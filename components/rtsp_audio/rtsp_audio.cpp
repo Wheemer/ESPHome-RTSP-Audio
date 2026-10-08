@@ -632,15 +632,14 @@ void RTSPAudioComponent::rtp_task_() {
     if (this->audio_buffer_ != nullptr) {
       const uint32_t deadline = now_ms() + (uint32_t) std::max(50, this->packet_ms_ * 4);
       while (bytes_read < input.size() && this->running_ && this->streaming_) {
-        // The INMP441 source commonly supplies 256-byte chunks every ~8 ms.
-        // A 2 ms follow-up wait turns each chunk into its own undersized RTP
-        // datagram, vastly increasing packet rate and exhausting Wi-Fi pbufs.
-        // Wait long enough to accumulate the configured packet duration while
-        // the outer deadline still bounds a stopped microphone.
-        TickType_t wait_ticks = bytes_read == 0 ? pdMS_TO_TICKS(std::max(50, this->packet_ms_ * 4)) : pdMS_TO_TICKS(10);
+        // MicrophoneSource delivers normal audio in chunks smaller than one
+        // RTP packet. A short empty interval between chunks must not turn a
+        // partial frame into an RTP datagram: that changes the packet clock
+        // and sounds like static or sped-up audio at the receiver.
+        TickType_t wait_ticks = pdMS_TO_TICKS(std::max(10, this->packet_ms_));
         size_t n = xStreamBufferReceive(this->audio_buffer_, input.data() + bytes_read, input.size() - bytes_read, wait_ticks);
         bytes_read += n;
-        if (n == 0 || now_ms() >= deadline) break;
+        if (now_ms() >= deadline) break;
       }
     }
     this->last_bytes_read_ = (uint32_t) bytes_read;
@@ -649,6 +648,14 @@ void RTSPAudioComponent::rtp_task_() {
       continue;
     }
     this->i2s_reads_++;
+
+    // Preserve RTP timing only for complete, configured-duration frames.
+    // A stalled source is represented as a dropped interval instead of a
+    // malformed short packet that a receiver may decode as noise.
+    if (bytes_read < input.size()) {
+      this->dropped_bytes_ += (uint32_t) bytes_read;
+      continue;
+    }
 
     int input_samples = bytes_read / 2;
     if (input_samples <= 0) continue;
