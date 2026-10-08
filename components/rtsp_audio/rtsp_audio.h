@@ -169,6 +169,8 @@ class RTSPAudioComponent : public Component {
   std::atomic<int32_t> last_min_{0};
   std::atomic<int32_t> last_max_{0};
   std::atomic<uint32_t> last_bytes_read_{0};
+  std::atomic<uint32_t> server_stack_free_{0};
+  std::atomic<uint32_t> rtp_stack_free_{0};
   uint32_t last_status_ms_{0};
   uint32_t last_send_error_log_ms_{0};
   std::string last_error_{"not started yet"};

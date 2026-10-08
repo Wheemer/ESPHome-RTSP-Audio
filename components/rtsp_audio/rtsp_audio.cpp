@@ -20,6 +20,11 @@ namespace esphome {
 namespace rtsp_audio {
 
 static const char *const TAG = "rtsp_audio";
+// ESP-IDF allocates task stacks from heap. This component previously reserved
+// 8 KB for each of its server, client, and RTP tasks, consuming 24 KB for one
+// stream before audio and lwIP buffers. The tasks keep packet data on the heap
+// and use shallow call frames, so 4 KB matches ESPHome's I2S microphone task.
+static constexpr uint32_t RTSP_TASK_STACK_BYTES = 4096;
 
 static uint32_t now_ms() { return (uint32_t) (esp_timer_get_time() / 1000ULL); }
 
@@ -106,7 +111,7 @@ void RTSPAudioComponent::setup() {
 
 bool RTSPAudioComponent::start_server_task_() {
   if (this->server_task_handle_ != nullptr) return true;
-  BaseType_t ok = xTaskCreatePinnedToCore(&RTSPAudioComponent::server_task_trampoline_, "rtsp_audio_srv", 8192, this, 5,
+  BaseType_t ok = xTaskCreatePinnedToCore(&RTSPAudioComponent::server_task_trampoline_, "rtsp_audio_srv", RTSP_TASK_STACK_BYTES, this, 5,
                                           &this->server_task_handle_, 0);
   if (ok != pdPASS) {
     this->last_error_ = "xTaskCreate server failed";
@@ -180,6 +185,7 @@ void RTSPAudioComponent::server_task_() {
     ESP_LOGI(TAG, "RTSP TCP control listening on 0.0.0.0:%d, max_clients=%d", this->port_, this->max_clients_);
 
     while (this->running_) {
+      this->server_stack_free_ = uxTaskGetStackHighWaterMark(nullptr);
       ::sockaddr_in peer = {};
       socklen_t len = sizeof(peer);
       int cfd = accept(this->server_fd_, (::sockaddr *) &peer, &len);
@@ -204,7 +210,7 @@ void RTSPAudioComponent::server_task_() {
       auto *arg = new ClientTaskArg{this, cfd, session_index};
       char task_name[20];
       snprintf(task_name, sizeof(task_name), "rtsp_audio_c%d", session_index);
-      BaseType_t ok = xTaskCreatePinnedToCore(&RTSPAudioComponent::client_task_trampoline_, task_name, 8192, arg, 5, nullptr, 0);
+      BaseType_t ok = xTaskCreatePinnedToCore(&RTSPAudioComponent::client_task_trampoline_, task_name, RTSP_TASK_STACK_BYTES, arg, 5, nullptr, 0);
       if (ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create RTSP client task for session %d", session_index);
         delete arg;
@@ -568,7 +574,7 @@ void RTSPAudioComponent::handle_rtsp_client_(int client_fd, int session_index) {
       if (!was_any_streaming && this->audio_buffer_ != nullptr) xStreamBufferReset(this->audio_buffer_);
       this->update_streaming_state_();
       if (this->rtp_task_handle_ == nullptr) {
-        xTaskCreatePinnedToCore(&RTSPAudioComponent::rtp_task_trampoline_, "rtsp_audio_rtp", 8192, this, 6,
+        xTaskCreatePinnedToCore(&RTSPAudioComponent::rtp_task_trampoline_, "rtsp_audio_rtp", RTSP_TASK_STACK_BYTES, this, 6,
                                 &this->rtp_task_handle_, 1);
       }
       char h[128];
@@ -607,6 +613,7 @@ void RTSPAudioComponent::rtp_task_() {
            this->rtpmap_name_(), this->sample_rate_, this->output_sample_rate_, this->packet_ms_, this->max_clients_);
 
   while (this->running_) {
+    this->rtp_stack_free_ = uxTaskGetStackHighWaterMark(nullptr);
     targets.clear();
     xSemaphoreTake(this->sessions_mutex_, portMAX_DELAY);
     for (int i = 0; i < (int) this->sessions_.size(); i++) {
@@ -827,12 +834,13 @@ void RTSPAudioComponent::loop() {
 void RTSPAudioComponent::log_status_(const char *reason) {
   ESP_LOGI(TAG,
            "RTSP native status [%s]: started=%s mic_running=%s clients=%d/%d streams=%d ip=%s port=%d free_heap=%u "
-           "codec=%s/%d packets=%u send_err=%u clip=%u reads=%u empty=%u drop=%u bytes=%u peak=%d min=%d max=%d last_error=%s",
+           "codec=%s/%d packets=%u send_err=%u clip=%u reads=%u empty=%u drop=%u bytes=%u stack_free=%u/%u peak=%d min=%d max=%d last_error=%s",
            reason, YESNO(this->started_.load()),
            YESNO(this->mic_source_ != nullptr && this->mic_source_->is_running()), this->active_client_count_(), this->max_clients_,
            this->active_stream_count_(), this->local_ip_().c_str(), this->port_, (unsigned) esp_get_free_heap_size(),
            this->rtpmap_name_(), this->output_sample_rate_, (unsigned) this->rtp_packets_.load(), (unsigned) this->rtp_send_errors_.load(),
            (unsigned) this->clipped_samples_.load(), (unsigned) this->i2s_reads_.load(), (unsigned) this->i2s_empty_reads_.load(), (unsigned) this->dropped_bytes_.load(), (unsigned) this->last_bytes_read_.load(),
+           (unsigned) this->server_stack_free_.load(), (unsigned) this->rtp_stack_free_.load(),
            (int) this->last_peak_.load(), (int) this->last_min_.load(), (int) this->last_max_.load(), this->last_error_.c_str());
 }
 
