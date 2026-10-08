@@ -5,6 +5,7 @@
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/components/microphone/microphone_source.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -100,6 +101,7 @@ class RTSPAudioComponent : public Component {
   static std::string base64_encode_(const std::string &input);
   void close_rtp_sockets_(int index);
   void close_all_client_sessions_();
+  void record_capture_diagnostic_(const std::vector<uint8_t> &data);
 
   microphone::Microphone *mic_{nullptr};
   microphone::MicrophoneSource *mic_source_{nullptr};
@@ -171,6 +173,15 @@ class RTSPAudioComponent : public Component {
   std::atomic<uint32_t> last_bytes_read_{0};
   std::atomic<uint32_t> server_stack_free_{0};
   std::atomic<uint32_t> rtp_stack_free_{0};
+  struct CaptureEnergy {
+    uint32_t timestamp_ms;
+    uint32_t mean_square;
+  };
+  static constexpr size_t CAPTURE_DIAGNOSTIC_CAPACITY = 192;
+  std::array<CaptureEnergy, CAPTURE_DIAGNOSTIC_CAPACITY> capture_energy_{};
+  size_t capture_energy_count_{0};
+  size_t capture_energy_next_{0};
+  uint32_t last_capture_diagnostic_ms_{0};
   uint32_t last_status_ms_{0};
   uint32_t last_send_error_log_ms_{0};
   uint32_t last_pacing_resync_log_ms_{0};

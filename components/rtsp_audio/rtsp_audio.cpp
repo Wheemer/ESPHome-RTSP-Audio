@@ -44,6 +44,64 @@ static std::string header_value(const std::string &request, const char *name) {
   return request.substr(pos, end - pos);
 }
 
+void RTSPAudioComponent::record_capture_diagnostic_(const std::vector<uint8_t> &data) {
+  if (!this->debug_ || data.size() < 2) return;
+
+  int64_t energy = 0;
+  int32_t peak = 0;
+  const size_t samples = data.size() / 2;
+  for (size_t i = 0; i < samples; i++) {
+    int16_t sample;
+    memcpy(&sample, &data[i * 2], sizeof(sample));
+    energy += static_cast<int64_t>(sample) * sample;
+    const int32_t magnitude = sample < 0 ? -static_cast<int32_t>(sample) : sample;
+    if (magnitude > peak) peak = magnitude;
+  }
+
+  const uint32_t now = now_ms();
+  this->capture_energy_[this->capture_energy_next_] = {now, static_cast<uint32_t>(energy / samples)};
+  this->capture_energy_next_ = (this->capture_energy_next_ + 1) % CAPTURE_DIAGNOSTIC_CAPACITY;
+  if (this->capture_energy_count_ < CAPTURE_DIAGNOSTIC_CAPACITY) this->capture_energy_count_++;
+  if (this->capture_energy_count_ < 100 || now - this->last_capture_diagnostic_ms_ < 5000U) return;
+  this->last_capture_diagnostic_ms_ = now;
+
+  const size_t oldest = (this->capture_energy_next_ + CAPTURE_DIAGNOSTIC_CAPACITY - this->capture_energy_count_) %
+                        CAPTURE_DIAGNOSTIC_CAPACITY;
+  uint64_t total = 0;
+  for (size_t i = 0; i < this->capture_energy_count_; i++) {
+    total += this->capture_energy_[(oldest + i) % CAPTURE_DIAGNOSTIC_CAPACITY].mean_square;
+  }
+  const double mean = static_cast<double>(total) / this->capture_energy_count_;
+
+  double best_correlation = -2.0;
+  uint32_t best_period_ms = 0;
+  for (size_t lag = 3; lag <= 6; lag++) {
+    double covariance = 0.0;
+    double earlier_variance = 0.0;
+    double later_variance = 0.0;
+    uint64_t period_total = 0;
+    for (size_t i = lag; i < this->capture_energy_count_; i++) {
+      const auto &earlier = this->capture_energy_[(oldest + i - lag) % CAPTURE_DIAGNOSTIC_CAPACITY];
+      const auto &later = this->capture_energy_[(oldest + i) % CAPTURE_DIAGNOSTIC_CAPACITY];
+      const double a = earlier.mean_square - mean;
+      const double b = later.mean_square - mean;
+      covariance += a * b;
+      earlier_variance += a * a;
+      later_variance += b * b;
+      period_total += later.timestamp_ms - earlier.timestamp_ms;
+    }
+    if (earlier_variance == 0.0 || later_variance == 0.0) continue;
+    const double correlation = covariance / std::sqrt(earlier_variance * later_variance);
+    if (correlation > best_correlation) {
+      best_correlation = correlation;
+      best_period_ms = static_cast<uint32_t>(period_total / (this->capture_energy_count_ - lag));
+    }
+  }
+  ESP_LOGI(TAG, "Raw I2S capture diagnostic: rms=%u peak=%d cadence=%u ms correlation=%.3f (pre-RTP)",
+           static_cast<unsigned>(std::sqrt(static_cast<double>(energy) / samples)), peak, best_period_ms,
+           best_correlation);
+}
+
 void RTSPAudioComponent::setup() {
   this->setup_attempts_++;
   this->running_ = true;
@@ -89,6 +147,7 @@ void RTSPAudioComponent::setup() {
   }
 
   this->mic_source_->add_data_callback([this](const std::vector<uint8_t> &data) {
+    this->record_capture_diagnostic_(data);
     if (this->audio_buffer_ != nullptr) {
       // Zero timeout: never block the microphone's own task. If the RTP
       // sender has fallen behind and the buffer is full, this just sends as
