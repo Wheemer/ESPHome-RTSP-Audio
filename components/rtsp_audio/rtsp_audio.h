@@ -1,318 +1,181 @@
 #pragma once
 
-#include "esphome/core/defines.h"
-#ifdef USE_RTSP_AUDIO
+#include "esphome/core/component.h"
+#include "esphome/core/log.h"
+#include "esphome/components/microphone/microphone.h"
+#include "esphome/components/microphone/microphone_source.h"
 
 #include <atomic>
-#include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <string>
+#include <vector>
 
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
-#include <freertos/task.h>
+#include "esp_netif.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
+#include "lwip/sockets.h"
 
-#include "biquad.h"
-#include "dc_blocker.h"
-#include "esphome/components/audio/audio.h"
-#include "esphome/components/microphone/microphone_source.h"
-#include "esphome/components/socket/socket.h"
-#include "esphome/core/component.h"
-#include "esphome/components/ring_buffer/ring_buffer.h"
-#include "gain.h"
-#include "high_cut_biquad.h"
-#include "low_cut_biquad.h"
-#include "teardown_guard.h"
+namespace esphome {
+namespace rtsp_audio {
 
-#ifdef USE_BINARY_SENSOR
-#include "esphome/components/binary_sensor/binary_sensor.h"
-#endif
-#ifdef USE_SENSOR
-#include "esphome/components/sensor/sensor.h"
-#endif
-#ifdef USE_TEXT_SENSOR
-#include "esphome/components/text_sensor/text_sensor.h"
-#endif
+enum class AudioCodec : uint8_t {
+  L16 = 0,
+  PCMU = 1,
+  PCMA = 2,
+};
 
-namespace esphome::rtsp_audio {
-
-/// Single-client RTSP server that streams the configured `MicrophoneSource`
-/// as RTP/AVP payload type 96 (`L16/<rate>/1`) over UDP (RFC 3551).
-///
-/// The component plugs the mic via `MicrophoneSource::add_data_callback`
-/// into an `esphome::RingBuffer`, then drains the buffer in `loop()` at the
-/// configured `packet_ms` cadence and emits RTP packets in network byte order.
-class RtspAudioComponent : public Component {
+class RTSPAudioComponent : public Component {
  public:
+  void set_microphone(microphone::Microphone *mic) { this->mic_ = mic; }
+  void set_port(int port) { this->port_ = port; }
+  void set_channel(uint8_t channel) { this->channel_ = channel; }
+  void set_gain_factor(int32_t gain_factor) { this->gain_factor_ = gain_factor; }
+  void set_codec(const std::string &codec) {
+    if (codec == "pcmu") {
+      this->codec_ = AudioCodec::PCMU;
+    } else if (codec == "pcma") {
+      this->codec_ = AudioCodec::PCMA;
+    } else {
+      this->codec_ = AudioCodec::L16;
+    }
+  }
+  void set_output_sample_rate(int sample_rate) { this->output_sample_rate_config_ = sample_rate; }
+  void set_rtp_config(int payload_type, int packet_ms) {
+    if (payload_type >= 0) {
+      this->rtp_payload_type_ = payload_type;
+      this->rtp_payload_type_user_set_ = true;
+    }
+    this->packet_ms_ = packet_ms;
+  }
+  void set_debug(bool debug) { this->debug_ = debug; }
+  void set_buffer_ms(int buffer_ms) { this->buffer_ms_ = buffer_ms; }
+  void set_max_clients(int max_clients) { this->max_clients_ = max_clients < 1 ? 1 : (max_clients > 6 ? 6 : max_clients); }
+  void set_status_interval(uint32_t interval_ms) { this->status_interval_ms_ = interval_ms; }
+  void set_auth(const std::string &username, const std::string &password, const std::string &realm) {
+    this->auth_username_ = username;
+    this->auth_password_ = password;
+    this->auth_realm_ = realm;
+    this->auth_enabled_ = !username.empty();
+  }
+
   void setup() override;
   void loop() override;
   void dump_config() override;
   void on_shutdown() override;
-  float get_setup_priority() const override { return setup_priority::AFTER_CONNECTION; }
-
-  void set_microphone_source(microphone::MicrophoneSource *mic) { this->mic_source_ = mic; }
-  void set_listen_port(uint16_t port) { this->listen_port_ = port; }
-  void set_packet_duration_ms(uint16_t ms) { this->packet_duration_ms_ = ms; }
-  void set_stream_buffer_ms(uint16_t ms) { this->stream_buffer_ms_ = ms; }
-
-  /// Updates the low-cut filter frequency (in Hz) at runtime. Called
-  /// from the bundled `number` platform when the HA slider moves and
-  /// from `Number::setup()` when the persisted value is restored on boot.
-  /// Values below LOW_CUT_MIN_CUTOFF_HZ (20 Hz) disable the stage
-  /// entirely (bit-identical bypass, mirroring the high-cut's
-  /// max-cutoff bypass). Out-of-range values above are clamped to
-  /// LOW_CUT_MAX_CUTOFF_HZ.
-  void set_low_cut_frequency_hz(float hz);
-
-  /// Updates the high-cut filter frequency (in Hz) at runtime. Called
-  /// from the bundled `number` platform when the HA slider moves and
-  /// from `Number::setup()` when the persisted value is restored on
-  /// boot. Out-of-range values are clamped to
-  /// [HIGH_CUT_MIN_CUTOFF_HZ, HIGH_CUT_MAX_CUTOFF_HZ]; a cutoff at the
-  /// max disables the filter via the bit-identical fast path in the
-  /// per-sample loop.
-  void set_high_cut_frequency_hz(float hz);
-
-  /// Updates the software audio gain (in dB) at runtime. Called from
-  /// the bundled `number` platform on slider moves and on restore.
-  /// Out-of-range values are clamped to
-  /// [internal::GAIN_DB_MIN, internal::GAIN_DB_MAX]; 0 dB takes the
-  /// bit-identical fast path in the per-sample loop. Internally the
-  /// dB value is converted to a Q8 linear coefficient — the audio hot
-  /// path never sees dB.
-  void set_gain_db(float db);
-
-#ifdef USE_BINARY_SENSOR
-  void set_client_connected_binary_sensor(binary_sensor::BinarySensor *s) { this->client_connected_bs_ = s; }
-#endif
-#ifdef USE_TEXT_SENSOR
-  void set_client_ip_text_sensor(text_sensor::TextSensor *s) { this->client_ip_ts_ = s; }
-#endif
-#ifdef USE_SENSOR
-  void set_bytes_sent_sensor(sensor::Sensor *s) { this->bytes_sent_sensor_ = s; }
-  void set_cpu_use_pct_sensor(sensor::Sensor *s) { this->cpu_use_pct_sensor_ = s; }
-  void set_peak_level_dbfs_sensor(sensor::Sensor *s) { this->peak_level_dbfs_sensor_ = s; }
-#endif
+  float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
 
  protected:
-  // RTP payload type for dynamic L16 mapping in our SDP.
-  static constexpr uint8_t RTP_PAYLOAD_TYPE = 96;
-  static constexpr size_t RTP_HEADER_BYTES = 12;
-  // RTSP TCP-interleaved framing prefix: '$' + 1-byte channel + 2-byte length.
-  static constexpr size_t INTERLEAVE_HEADER_BYTES = 4;
-  // Control-socket output buffer sizing. `tx_buffer_` is reserve()d to
-  // TX_BUFFER_CAPACITY_BYTES once at setup() so it never reallocates — growing
-  // a std::string toward a large size needs old+new buffers at once and can
-  // exhaust the heap (and abort) on a no-PSRAM board. Interleaved RTP queueing
-  // stops at MAX_RTP_BACKLOG_BYTES, leaving headroom for RTSP responses so the
-  // buffer never has to grow past its reserved capacity.
-  static constexpr size_t TX_BUFFER_CAPACITY_BYTES = 8192;
-  static constexpr size_t MAX_RTP_BACKLOG_BYTES = 7168;
+  bool start_server_task_();
+  void stop_server_();
+  void log_status_(const char *reason);
+  std::string local_ip_() const;
 
-  // RTSP session inactivity timeout. Advertised verbatim in SETUP's
-  // `Session: ...;timeout=` field and enforced locally so the two can't
-  // drift.
-  static constexpr uint32_t SESSION_TIMEOUT_SECONDS = 60;
-
-  // Networking lifecycle.
-  void start_listen_socket_();
-  void try_accept_();
-  void drain_control_socket_();
-  void close_session_();
-  /// Closes the session if no RTSP request has arrived within
-  /// `session_timeout_seconds_`. Runs once per loop() tick.
-  void check_session_inactivity_();
-
-  // RTSP message dispatch.
-  bool handle_rtsp_message_(const std::string &request);
-  void send_rtsp_response_(const std::string &response);
-  /// Pushes as much of `tx_buffer_` to the control socket as it will accept.
-  /// All control-socket output (RTSP responses and interleaved RTP) flows
-  /// through this one buffer so the byte stream stays correctly ordered.
-  void flush_tx_buffer_();
-  std::string build_sdp_() const;
-
-  // Audio path.
-  /// Allocates the ring buffer + RTP packet buffer the first time we go to
-  /// PLAY. Both go through `RAMAllocator<uint8_t>` so capable boards can
-  /// place them in PSRAM (the same pattern voice_assistant uses).
-  bool allocate_stream_buffers_();
-  void deallocate_stream_buffers_();
-  void attach_mic_callback_();
-  void start_streaming_();
-  void stop_streaming_();
-  void maybe_send_rtp_();
+  static void server_task_trampoline_(void *arg);
   static void rtp_task_trampoline_(void *arg);
+  static void client_task_trampoline_(void *arg);
+  void server_task_();
   void rtp_task_();
-  /// Builds and sends exactly one RTP packet. Returns true only if a packet
-  /// left the socket; false means "no audio buffered yet" or "socket busy",
-  /// in which case the caller must not advance the pacing deadline.
-  bool send_one_rtp_packet_();
-  /// Emits the one-time first-packet confirmation, the >1 s underrun warning,
-  /// and the periodic throughput line. Called every loop() while streaming.
-  void log_stream_stats_(int64_t now);
 
-  /// Pushes the current session_active_ / client_rtp_addr_ state to whichever
-  /// of the optional client_connected / client_ip sensors the user wired up.
-  /// Called at every session edge (SETUP success, close_session_).
-  void publish_session_state_();
+  int create_tcp_server_();
+  int allocate_client_session_(int fd);
+  void release_client_session_(int index);
+  int active_client_count_() const;
+  int active_stream_count_() const;
+  void update_streaming_state_();
+  void handle_rtsp_client_(int client_fd, int session_index);
+  bool read_rtsp_request_(int fd, std::string &request);
+  void send_rtsp_response_(int fd, int code, const char *reason, int cseq, const std::string &headers, const std::string &body);
+  int parse_cseq_(const std::string &request) const;
+  bool parse_client_ports_(const std::string &request, int *rtp_port, int *rtcp_port) const;
+  std::string make_sdp_() const;
+  void configure_codec_();
+  const char *codec_name_() const;
+  const char *rtpmap_name_() const;
+  static uint8_t linear_to_ulaw_(int16_t sample);
+  static uint8_t linear_to_alaw_(int16_t sample);
+  bool request_authorized_(const std::string &request) const;
+  void send_auth_required_(int fd, int cseq);
+  static std::string base64_encode_(const std::string &input);
+  void close_rtp_sockets_(int index);
+  void close_all_client_sessions_();
 
-  // Configuration set by codegen / YAML.
+  microphone::Microphone *mic_{nullptr};
   microphone::MicrophoneSource *mic_source_{nullptr};
-  uint16_t listen_port_{8554};
-  uint16_t packet_duration_ms_{20};
-  uint16_t stream_buffer_ms_{1000};
+  StreamBufferHandle_t audio_buffer_{nullptr};
+  uint8_t channel_{0};
+  int32_t gain_factor_{4};
 
-  // Cached audio shape for the active microphone source.
-  audio::AudioStreamInfo stream_info_{};
-  uint32_t samples_per_packet_{0};
+  int port_{8554};
+  int sample_rate_{16000};  // populated from the microphone at setup() time
+  int output_sample_rate_{16000};
+  int output_sample_rate_config_{0};
+  AudioCodec codec_{AudioCodec::L16};
+  int rtp_payload_type_{96};
+  bool rtp_payload_type_user_set_{false};
+  int packet_ms_{20};
+  int buffer_ms_{200};
+  bool debug_{false};
+  uint32_t status_interval_ms_{10000};
+  bool auth_enabled_{false};
+  std::string auth_username_;
+  std::string auth_password_;
+  std::string auth_realm_{"ESPHome RTSP Audio"};
+  std::string auth_token_;
 
-  std::unique_ptr<::esphome::ring_buffer::RingBuffer> ring_buffer_;
-
-  // Sockets.
-  std::unique_ptr<socket::Socket> listen_socket_;
-  std::unique_ptr<socket::Socket> control_socket_;
-  std::unique_ptr<socket::Socket> rtp_socket_;
-  std::string rx_buffer_;
-
-  // RTSP session state.
-  bool session_active_{false};
+  std::atomic<bool> running_{false};
+  std::atomic<bool> started_{false};
+  std::atomic<bool> client_connected_{false};
   std::atomic<bool> streaming_{false};
-  // Deferred ring-buffer / RTP-packet free across the mic's asynchronous
-  // stop. See teardown_guard.h for the full rationale.
-  internal::TeardownGuard teardown_guard_;
-  uint32_t session_id_{1};
-  std::string content_base_;
-  std::string track_url_;
 
-  // Transport: false = RTP over UDP, true = RTP interleaved on the RTSP TCP
-  // connection. Chosen per-client at SETUP. `tx_buffer_` holds pending
-  // control-socket output for both RTSP responses and interleaved RTP.
-  std::atomic<bool> interleaved_{false};
-  uint8_t rtp_channel_{0};
-  std::string tx_buffer_;
-
-  // RTP destination + bookkeeping.
-  sockaddr_storage client_rtp_addr_{};
-  uint16_t server_rtp_port_{0};
-  uint16_t rtp_seq_{0};
-  uint32_t rtp_ts_{0};
-  uint32_t rtp_ssrc_{0};
-  int64_t last_rtp_usec_{0};
-  int64_t last_rtsp_activity_usec_{0};
-  uint32_t rtp_interval_usec_{20'000};
-
-  // Streaming diagnostics (all reset on each PLAY).
-  uint32_t rtp_packets_sent_{0};
-  uint32_t bytes_sent_{0};
-  uint32_t stats_last_packets_{0};
-  int64_t last_stats_usec_{0};
-  int64_t last_packet_usec_{0};
-  bool first_packet_logged_{false};
-  bool underrun_warned_{false};
-
-  // Microphone delivery diagnostics — counts what arrives from MicrophoneSource,
-  // independent of the RTP send path, to pinpoint where the audio chain breaks.
-  uint32_t mic_callbacks_{0};
-  uint32_t mic_empty_callbacks_{0};
-  uint32_t mic_bytes_received_{0};
-
-  // DC blocker (1-pole HP at a fixed 5 Hz). Sits upstream of every
-  // other DSP stage — always on, not user-configurable. Kills the
-  // MEMS DC offset before it reaches the low-cut or gain stages.
-  // Reset to zero at the start of each PLAY so a new session doesn't
-  // inherit the previous one's transient.
-  internal::DcBlockerState dc_blocker_state_{};
-
-  // Low-cut filter (2nd-order Butterworth high-pass) state, applied per
-  // sample in the RTP send loop. Reset to zero at the start of each
-  // PLAY so a new session doesn't inherit the previous one's transient.
-  // Coefficients and the source-of-truth frequency are held separately
-  // because they survive across sessions and track the HA-controlled
-  // value. `lowcut_bypass_` mirrors the highcut equivalent: any HA
-  // slider value below LOW_CUT_MIN_CUTOFF_HZ (20 Hz) disables the
-  // stage, leaving only the always-on DC blocker upstream.
-  internal::BiquadState lowcut_state_{};
-  internal::BiquadCoeffs lowcut_coeffs_{
-      internal::low_cut_butterworth_coeffs(static_cast<float>(internal::LOW_CUT_DEFAULT_CUTOFF_HZ), 32000.0f)};
-  bool lowcut_bypass_{false};
-  float lowcut_filter_frequency_hz_{static_cast<float>(internal::LOW_CUT_DEFAULT_CUTOFF_HZ)};
-
-  // High-cut filter (2nd-order Butterworth low-pass) state. Same
-  // lifecycle as the low-cut: reset to zero at each PLAY so a new
-  // session doesn't inherit the previous one's transient. Defaults to
-  // the off sentinel (cutoff at Nyquist) so an un-touched HA install
-  // streams bit-identical bytes.
-  internal::BiquadState highcut_state_{};
-  internal::BiquadCoeffs highcut_coeffs_{};
-  bool highcut_bypass_{true};
-  float highcut_filter_frequency_hz_{static_cast<float>(internal::HIGH_CUT_DEFAULT_CUTOFF_HZ)};
-
-  // Software audio gain. Stored in Q8 so the RTP loop multiplies once
-  // per sample; `internal::GAIN_Q8_UNITY` (256) is the bit-identical
-  // skip-scaling fast path. Atomic so the number platform can update it
-  // from the HA control callback without locking against the audio loop.
-  std::atomic<int32_t> gain_q8_{internal::GAIN_Q8_UNITY};
-
-#ifdef USE_BINARY_SENSOR
-  binary_sensor::BinarySensor *client_connected_bs_{nullptr};
-#endif
-#ifdef USE_TEXT_SENSOR
-  text_sensor::TextSensor *client_ip_ts_{nullptr};
-  // Last value published, so we only push on change.
-  std::string client_ip_published_;
-#endif
-#ifdef USE_SENSOR
-  sensor::Sensor *bytes_sent_sensor_{nullptr};
-  uint32_t bytes_sent_published_{UINT32_MAX};
-  sensor::Sensor *cpu_use_pct_sensor_{nullptr};
-  // Last published percentage as tenths-of-percent (0..1000), so we can publish
-  // on change without floating-point comparisons. UINT16_MAX means "never
-  // published"; 0 means "last publish was 0.0 %", which is a valid value.
-  uint16_t cpu_use_published_tenths_{UINT16_MAX};
-  // Post-gain peak meter. `window_peak_abs_` accumulates max |sample| seen
-  // across all packets in the current 5 s stats window, then resets after
-  // each publish. `peak_level_published_dbfs_` is the last value sent to HA
-  // in whole dB; INT16_MAX is the "never published" sentinel so the first
-  // value always emits even if it happens to land on the silence floor.
-  // The silence floor (a real, in-band number) is also what we publish on
-  // session close so HA's history graph stays a continuous numeric series
-  // rather than introducing an unavailable gap.
-  sensor::Sensor *peak_level_dbfs_sensor_{nullptr};
-  uint16_t window_peak_abs_{0};
-  int16_t peak_level_published_dbfs_{INT16_MAX};
-  static constexpr int16_t SILENCE_FLOOR_DBFS = -100;
-#endif
-
-  // CPU-use self-instrumentation. `busy_usec_` accumulates the wall-clock µs
-  // spent inside `loop()` and the mic data callback; `cpu_window_start_usec_`
-  // marks the start of the current measurement window so the percentage is
-  // (busy / (now - window_start)) * 100. The atomic exists because the mic
-  // callback can fire from the I²S driver task on dual-core builds; relaxed
-  // ordering is enough since we only need eventual visibility, not a happens-
-  // before edge with any other data. The reported value covers our own work
-  // only — Wi-Fi/LwIP, the I²S driver, and other ESPHome components are not
-  // counted (see CHANGELOG / docs for how to read the number).
-  std::atomic<int64_t> busy_usec_{0};
-  int64_t cpu_window_start_usec_{0};
-  // Counts 5 s stats ticks so we can publish CPU-use every other tick (~10 s)
-  // without adding a second timer. Reset on each PLAY.
-  uint8_t stats_tick_{0};
-
-  // RTP packet buffer (header + payload). Allocated via RAMAllocator on PLAY,
-  // freed on TEARDOWN. `rtp_packet_size_` is computed at setup() so we know
-  // up-front how much we'll need to allocate later.
-  uint8_t *rtp_packet_{nullptr};
-  size_t rtp_packet_size_{0};
-
-  // The microphone callback and RTP task are a single producer/consumer pair.
-  // This lock only protects session-owned sockets and buffer lifetime during
-  // START/STOP; the FreeRTOS ring buffer protects the audio data itself.
-  SemaphoreHandle_t rtp_mutex_{nullptr};
+  TaskHandle_t server_task_handle_{nullptr};
   TaskHandle_t rtp_task_handle_{nullptr};
+  int server_fd_{-1};
+  struct ClientSession {
+    bool allocated{false};
+    bool playing{false};
+    int control_fd{-1};
+    int rtp_fd{-1};
+    int rtcp_fd{-1};
+    int server_rtp_port{0};
+    int server_rtcp_port{0};
+    uint32_t ssrc{0};
+    uint16_t rtp_sequence{0};
+    uint32_t rtp_timestamp{0};
+    std::string session_id;
+    ::sockaddr_in client_rtp_addr{};
+    ::sockaddr_in client_rtcp_addr{};
+  };
+
+  struct ClientTaskArg {
+    RTSPAudioComponent *self;
+    int fd;
+    int session_index;
+  };
+
+  int max_clients_{2};
+  std::vector<ClientSession> sessions_;
+  SemaphoreHandle_t sessions_mutex_{nullptr};
+
+  uint32_t setup_attempts_{0};
+  std::atomic<uint32_t> rtp_packets_{0};
+  std::atomic<uint32_t> rtp_send_errors_{0};
+  std::atomic<uint32_t> clipped_samples_{0};
+  std::atomic<uint32_t> i2s_reads_{0};
+  std::atomic<uint32_t> i2s_empty_reads_{0};
+  std::atomic<uint32_t> dropped_bytes_{0};
+  std::atomic<int32_t> last_peak_{0};
+  std::atomic<int32_t> last_min_{0};
+  std::atomic<int32_t> last_max_{0};
+  std::atomic<uint32_t> last_bytes_read_{0};
+  std::atomic<uint32_t> server_stack_free_{0};
+  std::atomic<uint32_t> rtp_stack_free_{0};
+  uint32_t last_status_ms_{0};
+  uint32_t last_send_error_log_ms_{0};
+  uint32_t last_pacing_resync_log_ms_{0};
+  std::string last_error_{"not started yet"};
 };
 
-}  // namespace esphome::rtsp_audio
-
-#endif  // USE_RTSP_AUDIO
+}  // namespace rtsp_audio
+}  // namespace esphome
