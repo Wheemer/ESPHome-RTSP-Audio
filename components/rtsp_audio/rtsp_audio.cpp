@@ -887,26 +887,6 @@ void RtspAudioComponent::rtp_task_() {
   while (true) {
     vTaskDelayUntil(&last_wake, interval);
 
-    // vTaskDelayUntil returns immediately when this task has missed a release.
-    // Without resynchronising, each immediate retry emits another stale RTP
-    // packet in a burst. Drop that stale capture and advance RTP time so the
-    // receiver observes an ordinary gap instead of fast or scratchy audio.
-    const TickType_t now = xTaskGetTickCount();
-    const TickType_t late_ticks = now - last_wake;
-    if (late_ticks >= interval) {
-      const uint32_t skipped_packets = static_cast<uint32_t>(late_ticks / interval) + 1U;
-      xSemaphoreTake(this->rtp_mutex_, portMAX_DELAY);
-      if (this->streaming_.load(std::memory_order_acquire) &&
-          !this->interleaved_.load(std::memory_order_acquire) && this->ring_buffer_ != nullptr) {
-        this->ring_buffer_->reset();
-        this->rtp_seq_ += static_cast<uint16_t>(skipped_packets);
-        this->rtp_ts_ += skipped_packets * this->samples_per_packet_;
-      }
-      xSemaphoreGive(this->rtp_mutex_);
-      last_wake = now;
-      continue;
-    }
-
     xSemaphoreTake(this->rtp_mutex_, portMAX_DELAY);
     if (this->streaming_.load(std::memory_order_acquire) && !this->interleaved_.load(std::memory_order_acquire) &&
         this->ring_buffer_ != nullptr && this->rtp_packet_ != nullptr && this->rtp_socket_ != nullptr) {
@@ -1102,13 +1082,29 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
   }
 
   // UDP transport.
-  ssize_t sent = this->rtp_socket_->sendto(header, packet_len, 0, reinterpret_cast<sockaddr *>(&this->client_rtp_addr_),
-                                           sizeof(sockaddr_in));
+  // ESP-IDF/lwIP can transiently return ENOMEM while its Wi-Fi TX pbufs are
+  // being released. Retrying after one scheduler tick is the IDF-recommended
+  // handling; dropping the packet immediately turns that short backpressure
+  // into audible loss.
+  ssize_t sent = -1;
+  int send_error = 0;
+  constexpr uint8_t MAX_ENOMEM_RETRIES = 3;
+  for (uint8_t attempt = 0; attempt <= MAX_ENOMEM_RETRIES; attempt++) {
+    sent = this->rtp_socket_->sendto(header, packet_len, 0, reinterpret_cast<sockaddr *>(&this->client_rtp_addr_),
+                                     sizeof(sockaddr_in));
+    if (sent >= 0)
+      break;
+
+    send_error = errno;
+    if (send_error != ENOMEM || attempt == MAX_ENOMEM_RETRIES)
+      break;
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
   if (sent < 0) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK)
-        ESP_LOGD(TAG, "RTP send would block; dropping packet");
-      else
-        ESP_LOGW(TAG, "RTP sendto errno=%d; dropping packet", errno);
+    if (send_error == EAGAIN || send_error == EWOULDBLOCK)
+      ESP_LOGD(TAG, "RTP send would block; dropping packet");
+    else
+      ESP_LOGW(TAG, "RTP sendto errno=%d; dropping packet", send_error);
       // The audio buffer has already been consumed. Advance the RTP timeline
       // so the receiver sees a normal loss rather than decoding later audio at
       // the failed packet's sequence number and timestamp.
