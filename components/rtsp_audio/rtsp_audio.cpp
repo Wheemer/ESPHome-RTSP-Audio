@@ -626,7 +626,12 @@ void RTSPAudioComponent::rtp_task_() {
     if (this->audio_buffer_ != nullptr) {
       const uint32_t deadline = now_ms() + (uint32_t) std::max(50, this->packet_ms_ * 4);
       while (bytes_read < input.size() && this->running_ && this->streaming_) {
-        TickType_t wait_ticks = bytes_read == 0 ? pdMS_TO_TICKS(std::max(50, this->packet_ms_ * 4)) : pdMS_TO_TICKS(2);
+        // The INMP441 source commonly supplies 256-byte chunks every ~8 ms.
+        // A 2 ms follow-up wait turns each chunk into its own undersized RTP
+        // datagram, vastly increasing packet rate and exhausting Wi-Fi pbufs.
+        // Wait long enough to accumulate the configured packet duration while
+        // the outer deadline still bounds a stopped microphone.
+        TickType_t wait_ticks = bytes_read == 0 ? pdMS_TO_TICKS(std::max(50, this->packet_ms_ * 4)) : pdMS_TO_TICKS(10);
         size_t n = xStreamBufferReceive(this->audio_buffer_, input.data() + bytes_read, input.size() - bytes_read, wait_ticks);
         bytes_read += n;
         if (n == 0 || now_ms() >= deadline) break;
