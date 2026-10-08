@@ -187,7 +187,6 @@ void RtspAudioComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  Listen port: %u", this->listen_port_);
   ESP_LOGCONFIG(TAG, "  Packet ms: %u", this->packet_duration_ms_);
   ESP_LOGCONFIG(TAG, "  Diagnostics: %s", YESNO(this->diagnostics_enabled_));
-  ESP_LOGCONFIG(TAG, "  Session timeout: %lus", static_cast<unsigned long>(SESSION_TIMEOUT_SECONDS));
   ESP_LOGCONFIG(TAG, "  Audio: %lu Hz / %u ch / %u bit, %lu samples/pkt",
                 static_cast<unsigned long>(this->stream_info_.get_sample_rate()), this->stream_info_.get_channels(),
                 this->stream_info_.get_bits_per_sample(), static_cast<unsigned long>(this->samples_per_packet_));
@@ -287,8 +286,6 @@ void RtspAudioComponent::loop() {
     this->try_accept_();
   if (this->control_socket_)
     this->drain_control_socket_();
-  if (this->control_socket_)
-    this->check_session_inactivity_();
   // Give pending TCP-interleaved media a chance to leave before deciding
   // whether another RTP packet fits. This avoids treating ordinary socket
   // backpressure as an audio-loss condition.
@@ -436,7 +433,6 @@ void RtspAudioComponent::try_accept_() {
   this->track_url_.clear();
   this->interleaved_ = false;
   this->tx_buffer_.clear();
-  this->last_rtsp_activity_usec_ = esp_timer_get_time();
   ESP_LOGI(TAG, "RTSP client accepted (session %lu)", static_cast<unsigned long>(this->session_id_));
 }
 
@@ -542,8 +538,6 @@ bool RtspAudioComponent::handle_rtsp_message_(const std::string &request) {
   if (lines.empty())
     return true;
 
-  this->last_rtsp_activity_usec_ = esp_timer_get_time();
-
   const std::string &request_line = lines[0];
   auto sp_method = request_line.find(' ');
   if (sp_method == std::string::npos)
@@ -611,10 +605,9 @@ bool RtspAudioComponent::handle_rtsp_message_(const std::string &request) {
       this->rtp_channel_ = tr.rtp_channel;
       this->rtp_socket_.reset();
       this->send_rtsp_response_(
-          str_sprintf("RTSP/1.0 200 OK\r\n%sSession: %lu;timeout=%lu\r\n"
+          str_sprintf("RTSP/1.0 200 OK\r\n%sSession: %lu\r\n"
                       "Transport: RTP/AVP/TCP;unicast;interleaved=%u-%u\r\n\r\n",
                       cseq_hdr.c_str(), static_cast<unsigned long>(this->session_id_),
-                      static_cast<unsigned long>(SESSION_TIMEOUT_SECONDS),
                       static_cast<unsigned>(tr.rtp_channel), static_cast<unsigned>(tr.rtcp_channel)));
       this->session_active_ = true;
       this->publish_session_state_();
@@ -668,11 +661,11 @@ bool RtspAudioComponent::handle_rtsp_message_(const std::string &request) {
       this->server_rtp_port_ = ntohs(reinterpret_cast<sockaddr_in *>(&local)->sin_port);
 
     this->send_rtsp_response_(
-        str_sprintf("RTSP/1.0 200 OK\r\n%sSession: %lu;timeout=%lu\r\n"
+        str_sprintf("RTSP/1.0 200 OK\r\n%sSession: %lu\r\n"
                     "Transport: RTP/AVP;unicast;client_port=%u-%u;server_port=%u-%u\r\n\r\n",
                     cseq_hdr.c_str(), static_cast<unsigned long>(this->session_id_),
-                    static_cast<unsigned long>(SESSION_TIMEOUT_SECONDS), static_cast<unsigned>(tr.client_rtp_port),
-                    static_cast<unsigned>(tr.client_rtcp_port), static_cast<unsigned>(this->server_rtp_port_),
+                    static_cast<unsigned>(tr.client_rtp_port), static_cast<unsigned>(tr.client_rtcp_port),
+                    static_cast<unsigned>(this->server_rtp_port_),
                     static_cast<unsigned>(this->server_rtp_port_ + 1)));
     this->session_active_ = true;
     this->publish_session_state_();
@@ -862,13 +855,6 @@ void RtspAudioComponent::publish_session_state_() {
     }
   }
 #endif
-}
-
-void RtspAudioComponent::check_session_inactivity_() {
-  if (!internal::session_is_idle(esp_timer_get_time(), this->last_rtsp_activity_usec_, SESSION_TIMEOUT_SECONDS))
-    return;
-  ESP_LOGW(TAG, "RTSP session idle > %lus; closing", static_cast<unsigned long>(SESSION_TIMEOUT_SECONDS));
-  this->close_session_();
 }
 
 void RtspAudioComponent::maybe_send_rtp_() {

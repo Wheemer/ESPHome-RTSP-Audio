@@ -108,19 +108,11 @@ class RtspAudioComponent : public Component {
   static constexpr size_t TX_BUFFER_CAPACITY_BYTES = 16384;
   static constexpr size_t MAX_RTP_BACKLOG_BYTES = 14336;
 
-  // RTSP session inactivity timeout. Advertised verbatim in SETUP's
-  // `Session: ...;timeout=` field and enforced locally so the two can't
-  // drift.
-  static constexpr uint32_t SESSION_TIMEOUT_SECONDS = 60;
-
   // Networking lifecycle.
   void start_listen_socket_();
   void try_accept_();
   void drain_control_socket_();
   void close_session_();
-  /// Closes the session if no RTSP request has arrived within
-  /// `session_timeout_seconds_`. Runs once per loop() tick.
-  void check_session_inactivity_();
 
   // RTSP message dispatch.
   bool handle_rtsp_message_(const std::string &request);
@@ -200,7 +192,6 @@ class RtspAudioComponent : public Component {
   uint32_t rtp_ts_{0};
   uint32_t rtp_ssrc_{0};
   int64_t last_rtp_usec_{0};
-  int64_t last_rtsp_activity_usec_{0};
   uint32_t rtp_interval_usec_{20'000};
 
   // Streaming diagnostics (all reset on each PLAY).
