@@ -607,6 +607,9 @@ void RTSPAudioComponent::rtp_task_() {
   std::vector<uint8_t> packet(12 + output_samples_per_packet * bytes_per_output_sample);
   std::vector<RtpTarget> targets;
   targets.reserve(6);
+  const TickType_t packet_ticks = pdMS_TO_TICKS(std::max(1, this->packet_ms_));
+  TickType_t last_release_tick = 0;
+  bool release_schedule_active = false;
 
   ESP_LOGI(TAG, "RTP task started: codec=%s input=%d Hz output=%d Hz, %d ms packets, max_clients=%d",
            this->rtpmap_name_(), this->sample_rate_, this->output_sample_rate_, this->packet_ms_, this->max_clients_);
@@ -624,8 +627,57 @@ void RTSPAudioComponent::rtp_task_() {
     xSemaphoreGive(this->sessions_mutex_);
 
     if (targets.empty()) {
+      release_schedule_active = false;
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
+    }
+
+    // RTP timing is a real-time clock, not a request to replay every queued
+    // packet. vTaskDelay() below used to start its delay only after capture and
+    // sending work had finished, so normal scheduling variance accumulated and
+    // the sender alternated between stale-buffer bursts and overflow drops.
+    // Keep an absolute schedule instead. If the task is more than one whole
+    // packet late, discard stale PCM and make the RTP timeline show the gap.
+    if (release_schedule_active) {
+      const TickType_t now_tick = xTaskGetTickCount();
+      const TickType_t elapsed_ticks = now_tick - last_release_tick;
+      if (elapsed_ticks >= packet_ticks * 2U) {
+        const uint32_t skipped_packets = elapsed_ticks / packet_ticks;
+        size_t discarded_bytes = 0;
+        while (this->audio_buffer_ != nullptr) {
+          const size_t available = xStreamBufferBytesAvailable(this->audio_buffer_);
+          if (available == 0)
+            break;
+          const size_t discarded = xStreamBufferReceive(this->audio_buffer_, input.data(),
+                                                         std::min(available, input.size()), 0);
+          if (discarded == 0)
+            break;
+          discarded_bytes += discarded;
+        }
+        this->dropped_bytes_ += static_cast<uint32_t>(discarded_bytes);
+
+        // The stale capture is gone, so the next packet must not claim it was
+        // recorded immediately after the prior one. Advance every active RTP
+        // stream by the missed packet intervals; receivers then see ordinary
+        // packet loss rather than time-compressed audio.
+        xSemaphoreTake(this->sessions_mutex_, portMAX_DELAY);
+        for (auto &session : this->sessions_) {
+          if (session.allocated && session.playing && session.rtp_fd >= 0) {
+            session.rtp_sequence += static_cast<uint16_t>(skipped_packets);
+            session.rtp_timestamp += static_cast<uint32_t>(skipped_packets * output_samples_per_packet);
+          }
+        }
+        xSemaphoreGive(this->sessions_mutex_);
+
+        last_release_tick = now_tick;
+        const uint32_t now = now_ms();
+        if (now - this->last_pacing_resync_log_ms_ >= 2000U) {
+          this->last_pacing_resync_log_ms_ = now;
+          ESP_LOGW(TAG, "RTP sender missed %u packet periods; discarded %u stale capture bytes", skipped_packets,
+                   static_cast<unsigned>(discarded_bytes));
+        }
+      }
+      vTaskDelayUntil(&last_release_tick, packet_ticks);
     }
 
     size_t bytes_read = 0;
@@ -759,10 +811,12 @@ void RTSPAudioComponent::rtp_task_() {
     }
 
     this->rtp_packets_++;
-    // Keep network delivery aligned with the RTP timeline. Draining a full
-    // stream buffer back-to-back produces UDP bursts even though timestamps
-    // advance by packet_ms_, which receivers render as digital scratching.
-    vTaskDelay(pdMS_TO_TICKS(std::max(1, this->packet_ms_)));
+    // Start the absolute cadence at the first complete frame. Subsequent
+    // iterations wait until the next release time before reading/sending.
+    if (!release_schedule_active) {
+      last_release_tick = xTaskGetTickCount();
+      release_schedule_active = true;
+    }
   }
   ESP_LOGI(TAG, "RTP task stopped");
 }
