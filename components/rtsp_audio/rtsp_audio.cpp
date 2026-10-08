@@ -673,7 +673,7 @@ void RTSPAudioComponent::rtp_task_() {
         const uint32_t now = now_ms();
         if (now - this->last_pacing_resync_log_ms_ >= 2000U) {
           this->last_pacing_resync_log_ms_ = now;
-          ESP_LOGW(TAG, "RTP sender missed %u packet periods; discarded %u stale capture bytes", skipped_packets,
+          ESP_LOGW(TAG, "RTP sender missed %" PRIu32 " packet periods; discarded %u stale capture bytes", skipped_packets,
                    static_cast<unsigned>(discarded_bytes));
         }
       }
