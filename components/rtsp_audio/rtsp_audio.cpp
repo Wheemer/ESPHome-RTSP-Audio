@@ -737,14 +737,17 @@ void RtspAudioComponent::start_streaming_() {
   this->mic_empty_callbacks_.store(0, std::memory_order_relaxed);
   this->mic_bytes_received_.store(0, std::memory_order_relaxed);
   this->ring_overwrite_bytes_.store(0, std::memory_order_relaxed);
+  this->ring_resync_drop_bytes_.store(0, std::memory_order_relaxed);
   this->ring_input_drop_bytes_.store(0, std::memory_order_relaxed);
   this->rtp_payload_bytes_drained_ = 0;
   this->tcp_backpressure_events_ = 0;
   this->tcp_backpressure_active_ = false;
+  this->tcp_backpressure_started_usec_ = 0;
   this->pacing_backlog_events_ = 0;
   this->pacing_backlog_active_ = false;
   this->stats_last_mic_bytes_ = 0;
   this->stats_last_overwrite_bytes_ = 0;
+  this->stats_last_resync_drop_bytes_ = 0;
   this->stats_last_input_drop_bytes_ = 0;
   this->stats_last_payload_bytes_drained_ = 0;
   this->stats_last_tcp_backpressure_events_ = 0;
@@ -865,6 +868,7 @@ void RtspAudioComponent::maybe_send_rtp_() {
     return;
 
   const int64_t now = esp_timer_get_time();
+  this->resync_after_tcp_backpressure_(now);
 
   // Catch-up pacing. Sending at most one packet per loop() and resetting the
   // deadline to `now` structurally under-drains the ring buffer: the effective
@@ -897,6 +901,36 @@ void RtspAudioComponent::maybe_send_rtp_() {
   }
 
   this->log_stream_stats_(now);
+}
+
+void RtspAudioComponent::resync_after_tcp_backpressure_(int64_t now) {
+  // Never cut bytes out of tx_buffer_: a partial TCP write may already have
+  // sent part of an interleaved RTP frame. Once it has drained, discard the
+  // stale capture-side buffer instead of trying to replay it late.
+  if (!this->tcp_backpressure_active_ || !this->tx_buffer_.empty())
+    return;
+
+  const int64_t stalled_usec = std::max<int64_t>(0, now - this->tcp_backpressure_started_usec_);
+  size_t discarded_bytes = 0;
+  {
+    LockGuard guard(this->ring_buffer_mutex_);
+    if (this->ring_buffer_ != nullptr) {
+      discarded_bytes = this->ring_buffer_->available();
+      this->ring_buffer_->reset();
+    }
+  }
+  this->ring_resync_drop_bytes_.fetch_add(discarded_bytes, std::memory_order_relaxed);
+
+  // RTP time must describe source time, not the time spent waiting for the
+  // receiver. Report the gap rather than compressing it into the next packet.
+  const uint64_t elapsed_samples =
+      (static_cast<uint64_t>(stalled_usec) * this->stream_info_.get_sample_rate()) / 1'000'000ULL;
+  this->rtp_ts_ += static_cast<uint32_t>(elapsed_samples);
+  const uint64_t skipped_packets =
+      (elapsed_samples + this->samples_per_packet_ - 1) / this->samples_per_packet_;
+  this->rtp_seq_ += static_cast<uint16_t>(std::max<uint64_t>(1, skipped_packets));
+  this->last_rtp_usec_ = now;
+  this->tcp_backpressure_active_ = false;
 }
 
 void RtspAudioComponent::log_stream_stats_(int64_t now) {
@@ -938,6 +972,7 @@ void RtspAudioComponent::log_stream_stats_(int64_t now) {
   if (this->diagnostics_enabled_ && now - this->last_diagnostic_usec_ >= 10'000'000) {
     const uint32_t mic_bytes = this->mic_bytes_received_.load(std::memory_order_relaxed);
     const uint32_t overwrite_bytes = this->ring_overwrite_bytes_.load(std::memory_order_relaxed);
+    const uint32_t resync_drop_bytes = this->ring_resync_drop_bytes_.load(std::memory_order_relaxed);
     const uint32_t input_drop_bytes = this->ring_input_drop_bytes_.load(std::memory_order_relaxed);
     size_t buffered = 0;
     {
@@ -946,17 +981,19 @@ void RtspAudioComponent::log_stream_stats_(int64_t now) {
         buffered = this->ring_buffer_->available();
     }
     ESP_LOGI(TAG,
-             "RTSP diag/10s: capture=%lu B, drained=%lu B, overwrite=%lu B, input-drop=%lu B, TCP-stalls=%lu, "
+             "RTSP diag/10s: capture=%lu B, drained=%lu B, overwrite=%lu B, resync-drop=%lu B, input-drop=%lu B, TCP-stalls=%lu, "
              "catch-up=%lu, loop-gap=%lu ms, tx-high=%zu B, buffered=%zu B",
              static_cast<unsigned long>(mic_bytes - this->stats_last_mic_bytes_),
              static_cast<unsigned long>(this->rtp_payload_bytes_drained_ - this->stats_last_payload_bytes_drained_),
              static_cast<unsigned long>(overwrite_bytes - this->stats_last_overwrite_bytes_),
+             static_cast<unsigned long>(resync_drop_bytes - this->stats_last_resync_drop_bytes_),
              static_cast<unsigned long>(input_drop_bytes - this->stats_last_input_drop_bytes_),
              static_cast<unsigned long>(this->tcp_backpressure_events_ - this->stats_last_tcp_backpressure_events_),
              static_cast<unsigned long>(this->pacing_backlog_events_ - this->stats_last_pacing_backlog_events_),
              static_cast<unsigned long>(this->max_loop_gap_usec_ / 1000), this->max_tx_buffer_bytes_, buffered);
     this->stats_last_mic_bytes_ = mic_bytes;
     this->stats_last_overwrite_bytes_ = overwrite_bytes;
+    this->stats_last_resync_drop_bytes_ = resync_drop_bytes;
     this->stats_last_input_drop_bytes_ = input_drop_bytes;
     this->stats_last_payload_bytes_drained_ = this->rtp_payload_bytes_drained_;
     this->stats_last_tcp_backpressure_events_ = this->tcp_backpressure_events_;
@@ -1060,6 +1097,7 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
     if (!this->tcp_backpressure_active_) {
       this->tcp_backpressure_events_++;
       this->tcp_backpressure_active_ = true;
+      this->tcp_backpressure_started_usec_ = esp_timer_get_time();
     }
     return false;
   }
@@ -1073,7 +1111,6 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
       return false;
   }
   this->rtp_payload_bytes_drained_ += payload_bytes;
-  this->tcp_backpressure_active_ = false;
 
   // Write RTP header in network byte order using the standard ESPHome helper.
   header[0] = 0x80;  // V=2, P=0, X=0, CC=0

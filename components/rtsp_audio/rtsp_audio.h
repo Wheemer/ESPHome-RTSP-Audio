@@ -106,7 +106,10 @@ class RtspAudioComponent : public Component {
   // stops at MAX_RTP_BACKLOG_BYTES, leaving headroom for RTSP responses so the
   // buffer never has to grow past its reserved capacity.
   static constexpr size_t TX_BUFFER_CAPACITY_BYTES = 16384;
-  static constexpr size_t MAX_RTP_BACKLOG_BYTES = 14336;
+  // Keep no more than about three 20 ms L16 packets pending. RTSP over TCP
+  // must preserve byte order, but keeping a large backlog turns a short
+  // receiver stall into delayed, discontinuous audio when it recovers.
+  static constexpr size_t MAX_RTP_BACKLOG_BYTES = 2048;
 
   // Networking lifecycle.
   void start_listen_socket_();
@@ -133,6 +136,10 @@ class RtspAudioComponent : public Component {
   void start_streaming_();
   void stop_streaming_();
   void maybe_send_rtp_();
+  /// Drops stale captured PCM after TCP flow control recovers. RTP timestamp
+  /// and sequence are advanced so downstream decoders see a real gap rather
+  /// than a burst of old samples.
+  void resync_after_tcp_backpressure_(int64_t now);
   /// Builds and sends exactly one RTP packet. Returns true only if a packet
   /// left the socket; false means "no audio buffered yet" or "socket busy",
   /// in which case the caller must not advance the pacing deadline.
@@ -214,6 +221,8 @@ class RtspAudioComponent : public Component {
   uint32_t rtp_payload_bytes_drained_{0};
   uint32_t tcp_backpressure_events_{0};
   bool tcp_backpressure_active_{false};
+  int64_t tcp_backpressure_started_usec_{0};
+  std::atomic<uint32_t> ring_resync_drop_bytes_{0};
   uint32_t pacing_backlog_events_{0};
   bool pacing_backlog_active_{false};
   int64_t last_loop_usec_{0};
@@ -223,6 +232,7 @@ class RtspAudioComponent : public Component {
   // Snapshots for the optional ten-second measurement log.
   uint32_t stats_last_mic_bytes_{0};
   uint32_t stats_last_overwrite_bytes_{0};
+  uint32_t stats_last_resync_drop_bytes_{0};
   uint32_t stats_last_input_drop_bytes_{0};
   uint32_t stats_last_payload_bytes_drained_{0};
   uint32_t stats_last_tcp_backpressure_events_{0};
