@@ -759,7 +759,10 @@ void RTSPAudioComponent::rtp_task_() {
     }
 
     this->rtp_packets_++;
-    vTaskDelay(1);
+    // Keep network delivery aligned with the RTP timeline. Draining a full
+    // stream buffer back-to-back produces UDP bursts even though timestamps
+    // advance by packet_ms_, which receivers render as digital scratching.
+    vTaskDelay(pdMS_TO_TICKS(std::max(1, this->packet_ms_)));
   }
   ESP_LOGI(TAG, "RTP task stopped");
 }
