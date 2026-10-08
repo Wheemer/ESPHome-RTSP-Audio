@@ -1180,14 +1180,22 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
   ssize_t sent = this->rtp_socket_->sendto(header, packet_len, 0, reinterpret_cast<sockaddr *>(&this->client_rtp_addr_),
                                            sizeof(sockaddr_in));
   if (sent < 0) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK)
-      return false;
-    ESP_LOGW(TAG, "RTP sendto errno=%d", errno);
-    return false;
+    // The PCM packet was destructively removed from the capture ring before
+    // sendto(). Retrying as though nothing happened would send different audio
+    // with the same RTP sequence/timestamp, which corrupts the receiver's
+    // timeline. Drop this one packet and advance normally.
+    ESP_LOGW(TAG, "RTP sendto errno=%d; dropping packet", errno);
+    this->rtp_seq_++;
+    this->rtp_ts_ += this->samples_per_packet_;
+    return true;
   }
   if (static_cast<size_t>(sent) != packet_len) {
-    ESP_LOGW(TAG, "RTP short send %zd/%zu", sent, packet_len);
-    return false;
+    // UDP datagrams are atomic, so this is unexpected. The capture data is
+    // already consumed; preserve RTP continuity by treating it as a drop.
+    ESP_LOGW(TAG, "RTP short send %zd/%zu; dropping packet", sent, packet_len);
+    this->rtp_seq_++;
+    this->rtp_ts_ += this->samples_per_packet_;
+    return true;
   }
 
   this->rtp_seq_++;
