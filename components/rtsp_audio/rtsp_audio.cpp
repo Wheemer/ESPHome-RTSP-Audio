@@ -311,6 +311,13 @@ void RtspAudioComponent::attach_mic_callback_() {
     } else {
       this->mic_bytes_received_.fetch_add(data.size(), std::memory_order_relaxed);
     }
+    // Once TCP flow control has stopped the RTSP sender, retaining more PCM
+    // only guarantees stale playback and ring-buffer overwrites on recovery.
+    // Discard at the source until the sender has resynchronised to live audio.
+    if (this->tcp_backpressure_active_.load(std::memory_order_relaxed)) {
+      this->transport_drop_bytes_.fetch_add(data.size(), std::memory_order_relaxed);
+      return;
+    }
     LockGuard guard(this->ring_buffer_mutex_);
     if (this->ring_buffer_ != nullptr && !data.empty()) {
       const size_t free = this->ring_buffer_->free();
@@ -738,16 +745,18 @@ void RtspAudioComponent::start_streaming_() {
   this->mic_bytes_received_.store(0, std::memory_order_relaxed);
   this->ring_overwrite_bytes_.store(0, std::memory_order_relaxed);
   this->ring_resync_drop_bytes_.store(0, std::memory_order_relaxed);
+  this->transport_drop_bytes_.store(0, std::memory_order_relaxed);
   this->ring_input_drop_bytes_.store(0, std::memory_order_relaxed);
   this->rtp_payload_bytes_drained_ = 0;
   this->tcp_backpressure_events_ = 0;
-  this->tcp_backpressure_active_ = false;
+  this->tcp_backpressure_active_.store(false, std::memory_order_relaxed);
   this->tcp_backpressure_started_usec_ = 0;
   this->pacing_backlog_events_ = 0;
   this->pacing_backlog_active_ = false;
   this->stats_last_mic_bytes_ = 0;
   this->stats_last_overwrite_bytes_ = 0;
   this->stats_last_resync_drop_bytes_ = 0;
+  this->stats_last_transport_drop_bytes_ = 0;
   this->stats_last_input_drop_bytes_ = 0;
   this->stats_last_payload_bytes_drained_ = 0;
   this->stats_last_tcp_backpressure_events_ = 0;
@@ -907,7 +916,7 @@ void RtspAudioComponent::resync_after_tcp_backpressure_(int64_t now) {
   // Never cut bytes out of tx_buffer_: a partial TCP write may already have
   // sent part of an interleaved RTP frame. Once it has drained, discard the
   // stale capture-side buffer instead of trying to replay it late.
-  if (!this->tcp_backpressure_active_ || !this->tx_buffer_.empty())
+  if (!this->tcp_backpressure_active_.load(std::memory_order_relaxed) || !this->tx_buffer_.empty())
     return;
 
   const int64_t stalled_usec = std::max<int64_t>(0, now - this->tcp_backpressure_started_usec_);
@@ -930,7 +939,7 @@ void RtspAudioComponent::resync_after_tcp_backpressure_(int64_t now) {
       (elapsed_samples + this->samples_per_packet_ - 1) / this->samples_per_packet_;
   this->rtp_seq_ += static_cast<uint16_t>(std::max<uint64_t>(1, skipped_packets));
   this->last_rtp_usec_ = now;
-  this->tcp_backpressure_active_ = false;
+  this->tcp_backpressure_active_.store(false, std::memory_order_relaxed);
 }
 
 void RtspAudioComponent::log_stream_stats_(int64_t now) {
@@ -956,8 +965,8 @@ void RtspAudioComponent::log_stream_stats_(int64_t now) {
       this->underrun_warned_ = true;
       ESP_LOGW(TAG,
                "No RTP sent for >1s. Mic totals: %lu callbacks (%lu empty), %lu bytes; ring buffer %zu bytes. "
-               "If these totals are still rising, this is a transient send-side stall (e.g. Wi-Fi "
-               "activity) and is harmless once the stream recovers. If the totals are frozen, the "
+               "If these totals are still rising, the downstream TCP sender is stalled and stale PCM "
+               "will be discarded when it recovers. If the totals are frozen, the "
                "microphone stopped: 0 callbacks = MicrophoneSource not delivering; callbacks but "
                "0 bytes = I2S read no audio.",
                static_cast<unsigned long>(this->mic_callbacks_.load(std::memory_order_relaxed)),
@@ -973,6 +982,7 @@ void RtspAudioComponent::log_stream_stats_(int64_t now) {
     const uint32_t mic_bytes = this->mic_bytes_received_.load(std::memory_order_relaxed);
     const uint32_t overwrite_bytes = this->ring_overwrite_bytes_.load(std::memory_order_relaxed);
     const uint32_t resync_drop_bytes = this->ring_resync_drop_bytes_.load(std::memory_order_relaxed);
+    const uint32_t transport_drop_bytes = this->transport_drop_bytes_.load(std::memory_order_relaxed);
     const uint32_t input_drop_bytes = this->ring_input_drop_bytes_.load(std::memory_order_relaxed);
     size_t buffered = 0;
     {
@@ -981,12 +991,13 @@ void RtspAudioComponent::log_stream_stats_(int64_t now) {
         buffered = this->ring_buffer_->available();
     }
     ESP_LOGI(TAG,
-             "RTSP diag/10s: capture=%lu B, drained=%lu B, overwrite=%lu B, resync-drop=%lu B, input-drop=%lu B, TCP-stalls=%lu, "
+             "RTSP diag/10s: capture=%lu B, drained=%lu B, overwrite=%lu B, resync-drop=%lu B, transport-drop=%lu B, input-drop=%lu B, TCP-stalls=%lu, "
              "catch-up=%lu, loop-gap=%lu ms, tx-high=%zu B, buffered=%zu B",
              static_cast<unsigned long>(mic_bytes - this->stats_last_mic_bytes_),
              static_cast<unsigned long>(this->rtp_payload_bytes_drained_ - this->stats_last_payload_bytes_drained_),
              static_cast<unsigned long>(overwrite_bytes - this->stats_last_overwrite_bytes_),
              static_cast<unsigned long>(resync_drop_bytes - this->stats_last_resync_drop_bytes_),
+             static_cast<unsigned long>(transport_drop_bytes - this->stats_last_transport_drop_bytes_),
              static_cast<unsigned long>(input_drop_bytes - this->stats_last_input_drop_bytes_),
              static_cast<unsigned long>(this->tcp_backpressure_events_ - this->stats_last_tcp_backpressure_events_),
              static_cast<unsigned long>(this->pacing_backlog_events_ - this->stats_last_pacing_backlog_events_),
@@ -994,6 +1005,7 @@ void RtspAudioComponent::log_stream_stats_(int64_t now) {
     this->stats_last_mic_bytes_ = mic_bytes;
     this->stats_last_overwrite_bytes_ = overwrite_bytes;
     this->stats_last_resync_drop_bytes_ = resync_drop_bytes;
+    this->stats_last_transport_drop_bytes_ = transport_drop_bytes;
     this->stats_last_input_drop_bytes_ = input_drop_bytes;
     this->stats_last_payload_bytes_drained_ = this->rtp_payload_bytes_drained_;
     this->stats_last_tcp_backpressure_events_ = this->tcp_backpressure_events_;
@@ -1094,9 +1106,9 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
   const size_t packet_len = RTP_HEADER_BYTES + payload_bytes;
   if (this->interleaved_ &&
       this->tx_buffer_.size() + INTERLEAVE_HEADER_BYTES + packet_len > MAX_RTP_BACKLOG_BYTES) {
-    if (!this->tcp_backpressure_active_) {
+    if (!this->tcp_backpressure_active_.load(std::memory_order_relaxed)) {
       this->tcp_backpressure_events_++;
-      this->tcp_backpressure_active_ = true;
+      this->tcp_backpressure_active_.store(true, std::memory_order_relaxed);
       this->tcp_backpressure_started_usec_ = esp_timer_get_time();
     }
     return false;

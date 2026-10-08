@@ -220,9 +220,11 @@ class RtspAudioComponent : public Component {
   std::atomic<uint32_t> ring_input_drop_bytes_{0};
   uint32_t rtp_payload_bytes_drained_{0};
   uint32_t tcp_backpressure_events_{0};
-  bool tcp_backpressure_active_{false};
+  // Written by the ESPHome loop and read by the I2S callback task.
+  std::atomic<bool> tcp_backpressure_active_{false};
   int64_t tcp_backpressure_started_usec_{0};
   std::atomic<uint32_t> ring_resync_drop_bytes_{0};
+  std::atomic<uint32_t> transport_drop_bytes_{0};
   uint32_t pacing_backlog_events_{0};
   bool pacing_backlog_active_{false};
   int64_t last_loop_usec_{0};
@@ -233,6 +235,7 @@ class RtspAudioComponent : public Component {
   uint32_t stats_last_mic_bytes_{0};
   uint32_t stats_last_overwrite_bytes_{0};
   uint32_t stats_last_resync_drop_bytes_{0};
+  uint32_t stats_last_transport_drop_bytes_{0};
   uint32_t stats_last_input_drop_bytes_{0};
   uint32_t stats_last_payload_bytes_drained_{0};
   uint32_t stats_last_tcp_backpressure_events_{0};
