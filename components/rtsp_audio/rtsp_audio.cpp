@@ -498,16 +498,26 @@ void RtspAudioComponent::send_rtsp_response_(const std::string &response) {
 void RtspAudioComponent::flush_tx_buffer_() {
   if (this->tx_buffer_.empty() || !this->control_socket_)
     return;
-  ssize_t wr = this->control_socket_->write(this->tx_buffer_.data(), this->tx_buffer_.size());
-  if (wr < 0) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK)
-      return;  // socket full; retry next loop
-    ESP_LOGW(TAG, "Control socket write errno=%d", errno);
-    this->close_session_();
-    return;
-  }
-  if (wr > 0)
+
+  // A normal ESPHome loop tick is longer than one 20 ms RTP packet. If lwIP
+  // accepts only a partial write, returning after that single write lets a
+  // temporary backlog grow even while the socket is writable. Drain a small,
+  // bounded number of chunks so recovery can keep pace without monopolizing
+  // the main loop.
+  constexpr uint8_t MAX_WRITE_ATTEMPTS_PER_LOOP = 4;
+  for (uint8_t attempt = 0; attempt < MAX_WRITE_ATTEMPTS_PER_LOOP && !this->tx_buffer_.empty(); attempt++) {
+    ssize_t wr = this->control_socket_->write(this->tx_buffer_.data(), this->tx_buffer_.size());
+    if (wr < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        return;  // socket full; retry next loop
+      ESP_LOGW(TAG, "Control socket write errno=%d", errno);
+      this->close_session_();
+      return;
+    }
+    if (wr == 0)
+      return;
     this->tx_buffer_.erase(0, static_cast<size_t>(wr));
+  }
 }
 
 std::string RtspAudioComponent::build_sdp_() const {
