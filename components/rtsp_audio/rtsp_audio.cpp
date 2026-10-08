@@ -887,6 +887,26 @@ void RtspAudioComponent::rtp_task_() {
   while (true) {
     vTaskDelayUntil(&last_wake, interval);
 
+    // vTaskDelayUntil returns immediately when this task has missed a release.
+    // Without resynchronising, each immediate retry emits another stale RTP
+    // packet in a burst. Drop that stale capture and advance RTP time so the
+    // receiver observes an ordinary gap instead of fast or scratchy audio.
+    const TickType_t now = xTaskGetTickCount();
+    const TickType_t late_ticks = now - last_wake;
+    if (late_ticks >= interval) {
+      const uint32_t skipped_packets = static_cast<uint32_t>(late_ticks / interval) + 1U;
+      xSemaphoreTake(this->rtp_mutex_, portMAX_DELAY);
+      if (this->streaming_.load(std::memory_order_acquire) &&
+          !this->interleaved_.load(std::memory_order_acquire) && this->ring_buffer_ != nullptr) {
+        this->ring_buffer_->reset();
+        this->rtp_seq_ += static_cast<uint16_t>(skipped_packets);
+        this->rtp_ts_ += skipped_packets * this->samples_per_packet_;
+      }
+      xSemaphoreGive(this->rtp_mutex_);
+      last_wake = now;
+      continue;
+    }
+
     xSemaphoreTake(this->rtp_mutex_, portMAX_DELAY);
     if (this->streaming_.load(std::memory_order_acquire) && !this->interleaved_.load(std::memory_order_acquire) &&
         this->ring_buffer_ != nullptr && this->rtp_packet_ != nullptr && this->rtp_socket_ != nullptr) {
