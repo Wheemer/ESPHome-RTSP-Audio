@@ -9,6 +9,10 @@
 #include <memory>
 #include <string>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+
 #include "biquad.h"
 #include "dc_blocker.h"
 #include "esphome/components/audio/audio.h"
@@ -44,6 +48,7 @@ class RtspAudioComponent : public Component {
   void setup() override;
   void loop() override;
   void dump_config() override;
+  void on_shutdown() override;
   float get_setup_priority() const override { return setup_priority::AFTER_CONNECTION; }
 
   void set_microphone_source(microphone::MicrophoneSource *mic) { this->mic_source_ = mic; }
@@ -138,6 +143,8 @@ class RtspAudioComponent : public Component {
   void start_streaming_();
   void stop_streaming_();
   void maybe_send_rtp_();
+  static void rtp_task_trampoline_(void *arg);
+  void rtp_task_();
   /// Builds and sends exactly one RTP packet. Returns true only if a packet
   /// left the socket; false means "no audio buffered yet" or "socket busy",
   /// in which case the caller must not advance the pacing deadline.
@@ -171,7 +178,7 @@ class RtspAudioComponent : public Component {
 
   // RTSP session state.
   bool session_active_{false};
-  bool streaming_{false};
+  std::atomic<bool> streaming_{false};
   // Deferred ring-buffer / RTP-packet free across the mic's asynchronous
   // stop. See teardown_guard.h for the full rationale.
   internal::TeardownGuard teardown_guard_;
@@ -182,7 +189,7 @@ class RtspAudioComponent : public Component {
   // Transport: false = RTP over UDP, true = RTP interleaved on the RTSP TCP
   // connection. Chosen per-client at SETUP. `tx_buffer_` holds pending
   // control-socket output for both RTSP responses and interleaved RTP.
-  bool interleaved_{false};
+  std::atomic<bool> interleaved_{false};
   uint8_t rtp_channel_{0};
   std::string tx_buffer_;
 
@@ -298,6 +305,12 @@ class RtspAudioComponent : public Component {
   // up-front how much we'll need to allocate later.
   uint8_t *rtp_packet_{nullptr};
   size_t rtp_packet_size_{0};
+
+  // The microphone callback and RTP task are a single producer/consumer pair.
+  // This lock only protects session-owned sockets and buffer lifetime during
+  // START/STOP; the FreeRTOS ring buffer protects the audio data itself.
+  SemaphoreHandle_t rtp_mutex_{nullptr};
+  TaskHandle_t rtp_task_handle_{nullptr};
 };
 
 }  // namespace esphome::rtsp_audio

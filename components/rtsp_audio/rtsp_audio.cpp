@@ -168,6 +168,20 @@ void RtspAudioComponent::setup() {
 
   this->attach_mic_callback_();
 
+  this->rtp_mutex_ = xSemaphoreCreateMutex();
+  if (this->rtp_mutex_ == nullptr) {
+    ESP_LOGE(TAG, "RTP session mutex allocation failed");
+    this->mark_failed();
+    return;
+  }
+
+  if (xTaskCreatePinnedToCore(&RtspAudioComponent::rtp_task_trampoline_, "rtsp_audio_rtp", 4096, this, 6,
+                              &this->rtp_task_handle_, 1) != pdPASS) {
+    ESP_LOGE(TAG, "RTP sender task creation failed");
+    this->mark_failed();
+    return;
+  }
+
   // Reserve the control-socket output buffer once, up front, so it never has to
   // reallocate later. A large std::string reallocation needs the old and new
   // buffers simultaneously and can abort on a low-RAM board.
@@ -331,12 +345,16 @@ bool RtspAudioComponent::allocate_stream_buffers_() {
 }
 
 void RtspAudioComponent::deallocate_stream_buffers_() {
+  if (this->rtp_mutex_ != nullptr)
+    xSemaphoreTake(this->rtp_mutex_, portMAX_DELAY);
   this->ring_buffer_.reset();
   if (this->rtp_packet_ != nullptr) {
     RAMAllocator<uint8_t> allocator;
     allocator.deallocate(this->rtp_packet_, this->rtp_packet_size_);
     this->rtp_packet_ = nullptr;
   }
+  if (this->rtp_mutex_ != nullptr)
+    xSemaphoreGive(this->rtp_mutex_);
 }
 
 void RtspAudioComponent::start_listen_socket_() {
@@ -639,7 +657,7 @@ bool RtspAudioComponent::handle_rtsp_message_(const std::string &request) {
   }
 
   if (method == "play") {
-    if (!this->session_active_ || (!this->interleaved_ && !this->rtp_socket_)) {
+    if (!this->session_active_ || (!this->interleaved_.load(std::memory_order_acquire) && !this->rtp_socket_)) {
       this->send_rtsp_response_(str_sprintf("RTSP/1.0 454 Session Not Found\r\n%s\r\n", cseq_hdr.c_str()));
       return true;
     }
@@ -677,6 +695,7 @@ void RtspAudioComponent::start_streaming_() {
     ESP_LOGE(TAG, "Cannot start streaming: buffers unavailable");
     return;
   }
+  xSemaphoreTake(this->rtp_mutex_, portMAX_DELAY);
   this->ring_buffer_->reset();
 
   // Initial RTP state per RFC 3550: random SSRC and starting seq/timestamp.
@@ -686,7 +705,7 @@ void RtspAudioComponent::start_streaming_() {
     this->rtp_seq_ = 1;
   this->rtp_ts_ = esp_random();
 
-  this->streaming_ = true;
+  this->streaming_.store(true, std::memory_order_release);
   this->last_rtp_usec_ = esp_timer_get_time();
 
   // Reset streaming diagnostics for this session.
@@ -714,15 +733,18 @@ void RtspAudioComponent::start_streaming_() {
   // of this stream isn't biased by stale data.
   this->window_peak_abs_ = 0;
 #endif
+  xSemaphoreGive(this->rtp_mutex_);
 
   this->mic_source_->start();
   ESP_LOGI(TAG, "Streaming RTP: %u samples/packet (%u ms)", this->samples_per_packet_, this->packet_duration_ms_);
 }
 
 void RtspAudioComponent::stop_streaming_() {
-  if (!this->streaming_)
+  if (!this->streaming_.load(std::memory_order_acquire))
     return;
-  this->streaming_ = false;
+  xSemaphoreTake(this->rtp_mutex_, portMAX_DELAY);
+  this->streaming_.store(false, std::memory_order_release);
+  xSemaphoreGive(this->rtp_mutex_);
   if (this->mic_source_ != nullptr)
     this->mic_source_->stop();
 #ifdef USE_SENSOR
@@ -815,10 +837,14 @@ void RtspAudioComponent::check_session_inactivity_() {
 }
 
 void RtspAudioComponent::maybe_send_rtp_() {
-  if (!this->streaming_ || this->ring_buffer_ == nullptr || this->rtp_packet_ == nullptr)
+  if (!this->streaming_.load(std::memory_order_acquire) || this->ring_buffer_ == nullptr || this->rtp_packet_ == nullptr)
+    return;
+  // UDP emission is paced by rtp_task_(), not the variable-rate ESPHome loop.
+  if (!this->interleaved_.load(std::memory_order_acquire))
     return;
   // UDP needs the RTP socket; interleaved mode rides the control socket.
-  if (this->interleaved_ ? (this->control_socket_ == nullptr) : (this->rtp_socket_ == nullptr))
+  if (this->interleaved_.load(std::memory_order_acquire) ? (this->control_socket_ == nullptr)
+                                                          : (this->rtp_socket_ == nullptr))
     return;
 
   const int64_t now = esp_timer_get_time();
@@ -850,12 +876,40 @@ void RtspAudioComponent::maybe_send_rtp_() {
   this->log_stream_stats_(now);
 }
 
+void RtspAudioComponent::rtp_task_trampoline_(void *arg) {
+  static_cast<RtspAudioComponent *>(arg)->rtp_task_();
+}
+
+void RtspAudioComponent::rtp_task_() {
+  TickType_t last_wake = xTaskGetTickCount();
+  const TickType_t interval = pdMS_TO_TICKS(std::max<uint16_t>(1, this->packet_duration_ms_));
+
+  while (true) {
+    vTaskDelayUntil(&last_wake, interval);
+
+    xSemaphoreTake(this->rtp_mutex_, portMAX_DELAY);
+    if (this->streaming_.load(std::memory_order_acquire) && !this->interleaved_.load(std::memory_order_acquire) &&
+        this->ring_buffer_ != nullptr && this->rtp_packet_ != nullptr && this->rtp_socket_ != nullptr) {
+      this->send_one_rtp_packet_();
+    }
+    xSemaphoreGive(this->rtp_mutex_);
+  }
+}
+
+void RtspAudioComponent::on_shutdown() {
+  this->streaming_.store(false, std::memory_order_release);
+  if (this->rtp_task_handle_ != nullptr) {
+    vTaskDelete(this->rtp_task_handle_);
+    this->rtp_task_handle_ = nullptr;
+  }
+}
+
 void RtspAudioComponent::log_stream_stats_(int64_t now) {
   // One-time confirmation that media is actually leaving the device, including
   // the destination so it can be checked against the RTSP client's address.
   if (this->rtp_packets_sent_ > 0 && !this->first_packet_logged_) {
     this->first_packet_logged_ = true;
-    if (this->interleaved_) {
+    if (this->interleaved_.load(std::memory_order_acquire)) {
       ESP_LOGI(TAG, "First RTP packet sent (TCP-interleaved, channel %u)", static_cast<unsigned>(this->rtp_channel_));
     } else {
       auto *addr4 = reinterpret_cast<sockaddr_in *>(&this->client_rtp_addr_);
@@ -1007,7 +1061,7 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
 
   const size_t packet_len = RTP_HEADER_BYTES + payload_bytes;
 
-  if (this->interleaved_) {
+  if (this->interleaved_.load(std::memory_order_acquire)) {
     // Frame the packet on the RTSP TCP connection: '$' + channel + 16-bit
     // length + RTP. If the client is not draining the socket, drop whole
     // packets (never a partial one — that would corrupt the framing) but still
@@ -1032,13 +1086,21 @@ bool RtspAudioComponent::send_one_rtp_packet_() {
                                            sizeof(sockaddr_in));
   if (sent < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK)
-      return false;
-    ESP_LOGW(TAG, "RTP sendto errno=%d", errno);
-    return false;
+        ESP_LOGD(TAG, "RTP send would block; dropping packet");
+      else
+        ESP_LOGW(TAG, "RTP sendto errno=%d; dropping packet", errno);
+      // The audio buffer has already been consumed. Advance the RTP timeline
+      // so the receiver sees a normal loss rather than decoding later audio at
+      // the failed packet's sequence number and timestamp.
+      this->rtp_seq_++;
+      this->rtp_ts_ += this->samples_per_packet_;
+      return true;
   }
   if (static_cast<size_t>(sent) != packet_len) {
-    ESP_LOGW(TAG, "RTP short send %zd/%zu", sent, packet_len);
-    return false;
+      ESP_LOGW(TAG, "RTP short send %zd/%zu; dropping packet", sent, packet_len);
+      this->rtp_seq_++;
+      this->rtp_ts_ += this->samples_per_packet_;
+      return true;
   }
 
   this->rtp_seq_++;
