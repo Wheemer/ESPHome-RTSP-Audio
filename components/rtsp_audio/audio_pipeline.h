@@ -80,15 +80,4 @@ inline uint16_t process_l16_payload_inplace(int16_t *samples, size_t count, DcBl
   return peak_abs;
 }
 
-inline uint16_t byteswap_l16_payload_inplace(int16_t *samples, size_t count) {
-  uint16_t peak_abs = 0;
-  for (size_t i = 0; i < count; i++) {
-    const uint16_t a = abs_i16(samples[i]);
-    if (a > peak_abs)
-      peak_abs = a;
-    samples[i] = static_cast<int16_t>(byteswap_u16(static_cast<uint16_t>(samples[i])));
-  }
-  return peak_abs;
-}
-
 }  // namespace esphome::rtsp_audio::internal
