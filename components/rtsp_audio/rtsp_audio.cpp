@@ -345,7 +345,8 @@ bool RTSPAudioComponent::read_rtsp_request_(int fd, std::string &request, int64_
     int ready = select(fd + 1, &readable, nullptr, nullptr, &wait);
     if (ready == 0) {
       if (internal::session_is_idle(esp_timer_get_time(), last_activity_usec, RTSP_CLIENT_IDLE_TIMEOUT_SECONDS)) {
-        ESP_LOGW(TAG, "RTSP client idle for %u seconds; closing session", RTSP_CLIENT_IDLE_TIMEOUT_SECONDS);
+        ESP_LOGW(TAG, "RTSP client idle for %u seconds; closing session",
+                 static_cast<unsigned>(RTSP_CLIENT_IDLE_TIMEOUT_SECONDS));
         return false;
       }
       continue;
@@ -584,40 +585,38 @@ void RTSPAudioComponent::handle_rtsp_client_(int client_fd, int session_index) {
       getpeername(client_fd, (::sockaddr *) &peer, &peer_len);
       this->close_rtp_sockets_(session_index);
 
+      // This component sends RTP only. Reserving a second UDP socket for RTCP
+      // wastes a scarce lwIP socket on smaller ESP32 builds without providing
+      // any functionality.
       int rtp_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-      int rtcp_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-      if (rtp_fd < 0 || rtcp_fd < 0) {
-        if (rtp_fd >= 0) close(rtp_fd);
-        if (rtcp_fd >= 0) close(rtcp_fd);
+      if (rtp_fd < 0) {
+        ESP_LOGW(TAG, "Unable to create RTP socket: %s", strerror(errno));
         this->send_rtsp_response_(client_fd, 500, "Internal Server Error", cseq, "", "");
         continue;
       }
-
-      int sndbuf = 16 * 1024;
-      setsockopt(rtp_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
       ::sockaddr_in local = {};
       local.sin_family = AF_INET;
       local.sin_addr.s_addr = htonl(INADDR_ANY);
       local.sin_port = 0;
-      bind(rtp_fd, (::sockaddr *) &local, sizeof(local));
-      bind(rtcp_fd, (::sockaddr *) &local, sizeof(local));
+      if (bind(rtp_fd, (::sockaddr *) &local, sizeof(local)) < 0) {
+        ESP_LOGW(TAG, "Unable to bind RTP socket: %s", strerror(errno));
+        close(rtp_fd);
+        this->send_rtsp_response_(client_fd, 500, "Internal Server Error", cseq, "", "");
+        continue;
+      }
       socklen_t llen = sizeof(local);
       getsockname(rtp_fd, (::sockaddr *) &local, &llen);
       int server_rtp_port = ntohs(local.sin_port);
-      getsockname(rtcp_fd, (::sockaddr *) &local, &llen);
-      int server_rtcp_port = ntohs(local.sin_port);
+      int server_rtcp_port = server_rtp_port + 1;
 
       xSemaphoreTake(this->sessions_mutex_, portMAX_DELAY);
       auto &sess = this->sessions_[session_index];
       sess.rtp_fd = rtp_fd;
-      sess.rtcp_fd = rtcp_fd;
       sess.server_rtp_port = server_rtp_port;
       sess.server_rtcp_port = server_rtcp_port;
       sess.client_rtp_addr = peer;
-      sess.client_rtcp_addr = peer;
       sess.client_rtp_addr.sin_port = htons(client_rtp);
-      sess.client_rtcp_addr.sin_port = htons(client_rtcp);
       std::string session = sess.session_id;
       xSemaphoreGive(this->sessions_mutex_);
 
@@ -908,20 +907,16 @@ void RTSPAudioComponent::close_rtp_sockets_(int index) {
   if (index < 0 || index >= (int) this->sessions_.size()) return;
 
   int rtp_fd = -1;
-  int rtcp_fd = -1;
   xSemaphoreTake(this->sessions_mutex_, portMAX_DELAY);
   auto &sess = this->sessions_[index];
   sess.playing = false;
   rtp_fd = sess.rtp_fd;
-  rtcp_fd = sess.rtcp_fd;
   sess.rtp_fd = -1;
-  sess.rtcp_fd = -1;
   sess.server_rtp_port = 0;
   sess.server_rtcp_port = 0;
   xSemaphoreGive(this->sessions_mutex_);
 
   if (rtp_fd >= 0) close(rtp_fd);
-  if (rtcp_fd >= 0) close(rtcp_fd);
   this->update_streaming_state_();
 }
 

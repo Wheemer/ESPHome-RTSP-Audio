@@ -139,7 +139,6 @@ class RTSPAudioComponent : public Component {
     bool playing{false};
     int control_fd{-1};
     int rtp_fd{-1};
-    int rtcp_fd{-1};
     int server_rtp_port{0};
     int server_rtcp_port{0};
     uint32_t ssrc{0};
@@ -147,7 +146,6 @@ class RTSPAudioComponent : public Component {
     uint32_t rtp_timestamp{0};
     std::string session_id;
     ::sockaddr_in client_rtp_addr{};
-    ::sockaddr_in client_rtcp_addr{};
   };
 
   struct ClientTaskArg {
