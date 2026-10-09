@@ -99,9 +99,10 @@ void RTSPAudioComponent::record_capture_diagnostic_(const std::vector<uint8_t> &
       best_period_ms = static_cast<uint32_t>(period_total / (this->capture_energy_count_ - lag));
     }
   }
-  ESP_LOGI(TAG, "Raw I2S capture diagnostic: rms=%u peak=%d cadence=%u ms correlation=%.3f (pre-RTP)",
-           static_cast<unsigned>(std::sqrt(static_cast<double>(energy) / samples)), peak, best_period_ms,
-           best_correlation);
+  const uint32_t rms = static_cast<uint32_t>(std::sqrt(static_cast<double>(energy) / samples));
+  ESP_LOGI(TAG, "Raw I2S capture diagnostic: rms=%" PRIu32 " peak=%" PRIi32 " cadence=%" PRIu32
+                " ms correlation=%.3f (pre-RTP)",
+           rms, peak, best_period_ms, best_correlation);
 }
 
 void RTSPAudioComponent::setup() {
