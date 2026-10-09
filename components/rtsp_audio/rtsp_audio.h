@@ -86,7 +86,7 @@ class RTSPAudioComponent : public Component {
   int active_stream_count_() const;
   void update_streaming_state_();
   void handle_rtsp_client_(int client_fd, int session_index);
-  bool read_rtsp_request_(int fd, std::string &request);
+  bool read_rtsp_request_(int fd, std::string &request, int64_t &last_activity_usec);
   void send_rtsp_response_(int fd, int code, const char *reason, int cseq, const std::string &headers, const std::string &body);
   int parse_cseq_(const std::string &request) const;
   bool parse_client_ports_(const std::string &request, int *rtp_port, int *rtcp_port) const;

@@ -1,4 +1,5 @@
 #include "rtsp_audio.h"
+#include "session_timeout.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -25,6 +26,7 @@ static const char *const TAG = "rtsp_audio";
 // stream before audio and lwIP buffers. The tasks keep packet data on the heap
 // and use shallow call frames, so 4 KB matches ESPHome's I2S microphone task.
 static constexpr uint32_t RTSP_TASK_STACK_BYTES = 4096;
+static constexpr uint32_t RTSP_CLIENT_IDLE_TIMEOUT_SECONDS = 60;
 
 static uint32_t now_ms() { return (uint32_t) (esp_timer_get_time() / 1000ULL); }
 
@@ -331,12 +333,31 @@ void RTSPAudioComponent::update_streaming_state_() {
   this->streaming_ = this->active_stream_count_() > 0;
 }
 
-bool RTSPAudioComponent::read_rtsp_request_(int fd, std::string &request) {
+bool RTSPAudioComponent::read_rtsp_request_(int fd, std::string &request, int64_t &last_activity_usec) {
   request.clear();
   char buf[512];
   while (this->running_) {
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(fd, &readable);
+    timeval wait = {};
+    wait.tv_sec = 1;
+    int ready = select(fd + 1, &readable, nullptr, nullptr, &wait);
+    if (ready == 0) {
+      if (internal::session_is_idle(esp_timer_get_time(), last_activity_usec, RTSP_CLIENT_IDLE_TIMEOUT_SECONDS)) {
+        ESP_LOGW(TAG, "RTSP client idle for %u seconds; closing session", RTSP_CLIENT_IDLE_TIMEOUT_SECONDS);
+        return false;
+      }
+      continue;
+    }
+    if (ready < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+
     int n = recv(fd, buf, sizeof(buf), 0);
     if (n <= 0) return false;
+    last_activity_usec = esp_timer_get_time();
     request.append(buf, n);
     if (request.find("\r\n\r\n") != std::string::npos || request.find("\n\n") != std::string::npos) return true;
     if (request.size() > 4096) return false;
@@ -526,9 +547,10 @@ void RTSPAudioComponent::send_rtsp_response_(int fd, int code, const char *reaso
 }
 
 void RTSPAudioComponent::handle_rtsp_client_(int client_fd, int session_index) {
+  int64_t last_activity_usec = esp_timer_get_time();
   while (this->running_) {
     std::string req;
-    if (!this->read_rtsp_request_(client_fd, req)) break;
+    if (!this->read_rtsp_request_(client_fd, req, last_activity_usec)) break;
 
     int cseq = this->parse_cseq_(req);
     std::string first = req.substr(0, req.find('\n'));
